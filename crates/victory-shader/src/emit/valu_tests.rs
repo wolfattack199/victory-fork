@@ -866,6 +866,40 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
+    // v_mov_b32 v0, 0; v_cvt_f16_u16 / v_cvt_f16_i16 v0, v1 (VOP1 0x050 / 0x051).
+    let cases: &[(u16, u16, u16)] = &[
+        // (u16 / i16 input bits, f16 of the unsigned value, f16 of the signed value)
+        (0x0000, 0x0000, 0x0000), // 0
+        (0x0001, 0x3C00, 0x3C00), // 1.0
+        (0x07FF, 0x67FF, 0x67FF), // 2047, the last integer below 2048 that f16 holds
+        (0x0801, 0x6800, 0x6800), // 2049 ties to even: 2048
+        (0x7FFF, 0x7800, 0x7800), // 32767 rounds up to 32768
+        (0x8000, 0x7800, 0xF800), // 32768 / -32768
+        (0x8001, 0x7800, 0xF800), // 32769 rounds to 32768 / -32767 rounds to -32768
+        (0xFC00, 0x7BE0, 0xE400), // 64512 / -1024
+        (0xFFFE, 0x7C00, 0xC000), // 65534 overflows to +inf / -2
+        (0xFFFF, 0x7C00, 0xBC00), // 65535 overflows to +inf / -1
+    ];
+    for (op, what, pick) in [
+        (0x050u16, "v_cvt_f16_u16", 0usize),
+        (0x051, "v_cvt_f16_i16", 1),
+    ] {
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = if pick == 0 { cases[i].1 } else { cases[i].2 };
+            assert_eq!(
+                got,
+                u32::from(want),
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
+                cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
