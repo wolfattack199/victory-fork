@@ -170,9 +170,12 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     let in_a_row = terms.iter().copied().reduce(add).unwrap();
     assert_ne!(tree[0], in_a_row, "these terms tell the tree from another order");
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); not run");
+            return;
+        }
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
         Ok(x) => x,
@@ -227,9 +230,12 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }
-        let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 hardware device; not run");
-            return;
+        let host = match Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 hardware device ({e}); not run");
+                return;
+            }
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
             eprintln!("the hardware device does not take this program; not run");
@@ -301,9 +307,12 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // On a GPU that takes waves of 32 (two host waves for the console's one): the OR is of
     // both halves, whichever half's lanes take the branch.
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); not run");
+            return;
+        }
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
         Ok(x) => x,
@@ -340,9 +349,12 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return None;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); not run");
+            return None;
+        }
     };
     let Ok((root, pso)) = host.compute_pipeline(shader) else {
         eprintln!("the hardware device does not take this program; not run");

@@ -431,9 +431,12 @@ mod tests {
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
         use super::super::host::{Draw, Host};
-        let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
+        let host = match Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 device ({e}); skipped");
+                return;
+            }
         };
         let (vs, ps) = pass_through();
         if let Ok(mut v) = super::super::validator::Validator::load(
