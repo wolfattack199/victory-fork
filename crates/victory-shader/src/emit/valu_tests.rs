@@ -514,7 +514,8 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
 #[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
-    let ops: [(&str, u16, fn([u32; 3]) -> u32); 6] = [
+    type Pick = fn([u32; 3]) -> u32;
+    let ops: [(&str, u16, Pick); 6] = [
         ("v_min3_i32", 0x152, |t| {
             t.into_iter().min_by_key(|&x| x as i32).unwrap()
         }),
