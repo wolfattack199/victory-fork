@@ -47,13 +47,12 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
-        let (min_lod, max_lod) = if self.mip == 0 {
-            // Without a mip filter the console samples mip 0 only.
-            (0.0, 0.0)
+        let min_lod = finite_lod(self.min_lod, 0.0);
+        // Without a mip filter the console clamps sampling to `min_lod`.
+        let max_lod = if self.mip == 0 {
+            min_lod
         } else {
-            let min_lod = finite_lod(self.min_lod, 0.0);
-            let max_lod = finite_lod(self.max_lod, min_lod).max(min_lod);
-            (min_lod, max_lod)
+            finite_lod(self.max_lod, min_lod).max(min_lod)
         };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
@@ -147,13 +146,23 @@ mod tests {
     }
 
     #[test]
-    fn mip_none_forces_base_level_and_inverted_lod_range_clamps() {
+    fn mip_none_clamps_to_min_lod_and_inverted_lod_range_clamps() {
         let mut w = [0u32; 27];
         w[3] = 0; // mip none
         w[9] = 3.0f32.to_bits();
         w[10] = 8.0f32.to_bits();
         let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (3.0, 3.0));
+
+        w[9] = f32::NAN.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let d = console(&w);
         assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
+
+        w[9] = f32::INFINITY.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let d = console(&w);
+        assert_eq!((d.MinLOD, d.MaxLOD), (D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX));
 
         w[3] = 2; // linear mips
         w[9] = 4.0f32.to_bits();
