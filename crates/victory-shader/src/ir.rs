@@ -442,12 +442,7 @@ fn unspill(
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
-        list[i] = gfx10::Instruction {
-            offset: list[i].offset,
-            encoding,
-            opcode,
-            words: vec![word],
-        };
+        list[i] = gfx10::Instruction::new(list[i].offset, encoding, opcode, vec![word]);
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
@@ -1633,6 +1628,26 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn parked_scalars_become_moves_with_their_names() {
+        let p = build_words(
+            &[
+                0xBE86_0385, // s_mov_b32 s6, 5
+                0xD761_0005, // v_writelane_b32 v5, s6, 0
+                0x0201_0006,
+                0xBE86_0387, // s_mov_b32 s6, 7
+                0xD760_0006, // v_readlane_b32 s6, v5, 0
+                0x0201_0105,
+                0x7E02_0206, // v_mov_b32 v1, s6
+                S_ENDPGM,
+            ],
+            false,
+        );
+        // The rewritten save and restore must not keep the lane opcodes' names.
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names[..4], ["s_mov_b32"; 4]);
     }
 
     #[test]
