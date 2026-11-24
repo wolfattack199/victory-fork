@@ -1771,4 +1771,27 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// A dead interpolated channel removed by `bitcode::opt` must not remain
+    /// marked read in `ISG1` (the DXIL validator checks the input signature
+    /// against the surviving `loadInput` / `attributeAtVertex` calls).
+    #[test]
+    fn dead_input_read_is_cleared_from_isg1_after_opt() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y (dead)
+            0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y (dead)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let host = Container::parse(&shader.dxil).unwrap();
+        let isg1 = host.part(FourCC::ISG1).unwrap().data;
+        // Row 0's ReadWriteMask byte is at offset 8 (header) + 25.
+        assert_eq!(isg1[8 + 25], 0x1, "dead .y channel left in ISG1 rw mask");
+        validate(&shader);
+    }
 }

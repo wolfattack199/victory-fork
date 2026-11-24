@@ -63,6 +63,8 @@ pub const ALL: u32 = MODULE | FIRST;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// `dx.op.attributeAtVertex.*` (shader barycentrics).
+    pub barycentrics: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -1011,6 +1013,8 @@ impl Module {
                     }
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
+                } else if name.starts_with("attributeAtVertex") {
+                    u.barycentrics = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
@@ -1019,6 +1023,38 @@ impl Module {
             }
         }
         u
+    }
+
+    /// Per input signature element: bitmask of columns actually read by
+    /// reachable `dx.op.loadInput.*` or `dx.op.attributeAtVertex.*` calls.
+    pub(crate) fn input_usage(&self, count: usize) -> Vec<u8> {
+        let mut masks = vec![0u8; count];
+        let reached = self.reached();
+        for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
+            for &i in &blk.body {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                let name = self.funcs[*f as usize].name.as_str();
+                let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                if !(name.starts_with("loadInput.") || name.starts_with("attributeAtVertex.")) {
+                    continue;
+                }
+                let Some((_, id)) = args.get(1).and_then(|&v| self.int_k(v)) else {
+                    continue;
+                };
+                let Some((_, col)) = args.get(3).and_then(|&v| self.int_k(v)) else {
+                    continue;
+                };
+                if let Ok(id) = usize::try_from(id)
+                    && id < count
+                    && (0..4).contains(&col)
+                {
+                    masks[id] |= 1u8 << col;
+                }
+            }
+        }
+        masks
     }
 
     /// A constant table no remaining load reads leaves the module (the
