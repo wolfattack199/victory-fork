@@ -1097,8 +1097,10 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: `subresource_len` clamps `len` to `self.bytes - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -1116,6 +1118,18 @@ impl Staging {
             }
         }
     }
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1271,18 +1285,27 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        let unreadable = info.Protect == 0 || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        if n == 0 || info.State != MEM_COMMIT || unreadable {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -1536,6 +1559,61 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
+        // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    /// Both ways of asking: by page (the default) and by `VirtualQuery`.
+    #[test]
+    fn committed_rejects_overflow_and_noaccess_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let ways: [fn(*const u8, usize) -> bool; 2] = [committed, committed_by_query];
+        for committed in ways {
+            assert!(!committed(usize::MAX as *const u8, 16));
+            // SAFETY: reserving and committing one private page for the test, freed below.
+            let noaccess = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_NOACCESS,
+                )
+            };
+            assert!(!noaccess.is_null());
+            assert!(!committed(noaccess.cast::<u8>(), 4096));
+            // SAFETY: freeing the allocation above.
+            unsafe { VirtualFree(noaccess, 0, MEM_RELEASE) };
+
+            // Negative control: a readable committed page still passes.
+            // SAFETY: reserving and committing one private page for the test, freed below.
+            let rw = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!rw.is_null());
+            assert!(committed(rw.cast::<u8>(), 4096));
+            // SAFETY: freeing the allocation above.
+            unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
         }
     }
 }
