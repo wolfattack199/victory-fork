@@ -1327,9 +1327,12 @@ mod tests {
         let ps = constant_color();
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {
-            let Ok(host) = Host::new(warp) else {
-                eprintln!("no SM 6.6 {label} device; skipped");
-                continue;
+            let host = match Host::new(warp) {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("no SM 6.6 {label} device ({e}); skipped");
+                    continue;
+                }
             };
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             // SAFETY: the query writes the structure of the given size.
