@@ -330,7 +330,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// showed. A texture picked by index has a new staging buffer for every
 /// upload, and the print its slot is checked against is of the memory as it
 /// is, not of the zeros that went up, so it stayed black until the title
-/// wrote it again (16 such refreshes a frame in the opening cutscene). Its
+/// wrote it again (up to 24 such refreshes a frame in the opening cutscene). Its
 /// refresh waits for the lock.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -492,12 +492,12 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: std::sync::RwLock<Option<crate::fast::Set<usize>>> = std::sync::RwLock::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
     // Diagnostics (run 177): where its title memory is, for placed views
@@ -562,7 +562,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
@@ -574,8 +574,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
+    if host_wrote(resource)
+        && let Some(set) = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner()).as_mut()
+    {
         set.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
@@ -590,9 +591,14 @@ pub(crate) fn forget(resource: usize) {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    title_writes(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// [`title_written`] of a texture made with `flags`.
+pub(crate) fn title_writes(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
@@ -600,11 +606,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    let host_written = host_wrote(resource as usize);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {

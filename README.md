@@ -19,75 +19,114 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-25) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 822 tests pass, 2 fail, 15 are ignored. Of the two, one fails about every second run in the repository this is a copy of as well, the other failed here before this update |
+| Checks | 849 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
-| Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there |
-| Frame rate in the world | **not playable: 2.7 fps median**, 2.0 fps with all textures loading (the picture above); 10.9 fps at best, in one shot with little in it |
+| Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
+| Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
 ### Working on right now
 
-- **Frame rate.** The fixes designed before are written and in, and one more
-  was found while testing them (below). They made a frame's preparation
-  cheaper, but the whole frame is not faster yet: the PC has under 1 GB of
-  its 32 GB of memory free while the game runs, and Windows reads up to
-  190 MB a second back from the disk. Next: less memory used by the layer.
-- **Black faces after a cut.** Their textures arrive late. Next: the textures
-  of what is on screen go first.
+- **Frame rate: 20 fps first, then 30.** A frame of 115 ms is, as far as it is
+  understood: the title records for about 58 ms (most of it in our code), our
+  submitting thread works about 95 ms, the card is busy about 80 ms, and these
+  run partly one after the other. 20 fps needs all of it under 50 ms.
+- **The card's share.** Of its 75 ms, about 20 are ours (sending changed bytes
+  up, hashing them). The title's own lists take 54 ms, more than expected of
+  this card; why is not known.
+- **The first 75 s after loading**, which still crawl.
 
 ### Progress by area
 
 | Area | Done | Change | Based on |
 |---|---|---|---|
-| Frame rate towards 30 fps, typical scene | 9 % | 10 % before | measured: 2.7 fps median, 367 ms a frame. With all textures loading 2.0 fps (7 %) |
-| Frame rate towards 30 fps, best moments | 36 % | 23 % before | measured: 10.9 fps in one shot of 391 draws; 5.2 fps (17 %) where more is drawn |
-| Draws that reach the card | 90 % | 88 % before | measured. What is dropped includes the ray tracing builder's programs, which are off on purpose |
-| Shaders that translate | 99 % | more are counted now | measured: 25,679 of 25,889 in the game's whole library |
-| Shaders the game asks for that fail | 4 left | 12 before | measured: 3 refused by the driver, 1 not translated |
-| Shaders ready before you see them | 74 % | 99 % before | measured: 1,967 pipelines loaded, 695 made new in the first run after the translator changed; they are kept from then on |
-| Picture looks right | about 70 % | 50 % before | estimate: people and streets look right; late textures, no real shadows or reflections |
-| Textures and cars loading in time | about 55 % | 40 % before | estimate. The card no longer runs full: 8.5 GB in use, 13.4 GB before. Black faces after a cut are still there |
-| Audio | about 90 % | 80 % before | measured: no gap of 0.4 s or more in 88 s of two recordings; a whole session is not checked |
+| Frame rate towards 20 fps, first room, loaded | 42 % | 22 % before | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame) |
+| Frame rate towards 30 fps, the same | 28 % | 15 % before | the same run |
+| Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
+| Frame rate in the opening cutscene | not measured again | 9 % before | 2.7 fps then |
+| Card time a frame, towards the 50 ms of 20 fps | 66 % | 55 % before | measured: 76 ms busy (54 the title's lists, 20 sending and hashing, 2 comparing); 90 in a run with every small copy in the PC's memory. It counts as done at 50 |
+| Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
+| Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
+| Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
+| Picture looks right | about 75 % | 70 % before | estimate: the first room and its yard look right in most launches, see the table above; no ray traced shadows or reflections |
+| Textures and cars loading in time | about 55 % | no change | estimate |
+| Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
 | NVIDIA driver | 100 % | | the game draws through it |
 | DLSS | 0 % | | no code for it yet |
 | Ray tracing | 0 % | | off. A constant stands in for its indirect light (`VICTORY_AMBIENT`); that is not ray tracing |
 
-The measured rows come from the opening cutscene on the PC below. The
-estimates are my own judgment, not measurements.
+The measured rows come from the first room on the PC below, with the Series S
+profile and the switches listed. The estimates are my own judgment, not
+measurements.
 
 ### New in this update
 
-- **Why people were black: found, and mostly fixed.** Two causes. The game's
-  bounce light is ray traced and does not run here, so what the sun or a lamp
-  does not reach was black: `VICTORY_AMBIENT=0.2` puts a constant in its place
-  (by UwUCammie after Belobug; 0.6 is far too bright at night). And the card
-  was full, so thousands of textures were never loaded and read as black:
-  `VICTORY_LEVELS_ON_DEMAND=1` takes card memory only for the texture sizes
-  the game really holds, about 3.5 GB less here.
-- **One wait too many, fixed.** Four seconds into the world one read of 2 KB
-  overlapped a shader's write, and the layer then waited for the card before
-  all such reads, 13 times a frame, 70 to 146 ms. Now only reads of the 64 KB
-  where that was seen wait: 1 to 1.5 times a frame, about 34 ms.
-- Merged: fxceless/victory-fork up to `0b0074e`; the 16-bit buffer fix for
-  faces and mouths (tippythetaidum); two ray tracing fixes (sedzz, Pablo
-  Barros); the 32-lane shader fixes and page runs of #823 (Felix2180).
-- File writes go through views that are kept; the layer's frame threads run
-  at the priority of the game's threads that wait for them.
-- A change of a test file no longer throws away every translated shader.
+Nearly all of the gain is in threads that no longer wait for one another. The
+same scene, the last minute of unattended runs (average fps / median ms):
+
+| Run | What was new | fps | ms |
+|---|---|---|---|
+| m7 | before | 4.38 | 214 |
+| m11 | copies from 64 KB on in the card's memory, not 1 MB (`VICTORY_CARD_BUFFERS_MIN_KB=64`); the guards of title pages without one lock for all | 6.03 | 158 |
+| m15 | the recording threads' tables of descriptors and buffers without locks | 7.80 | 123 |
+| m18, m19 | the journal of written pages without a lock, only changed copies asked for, fewer small allocations | 8.49, 8.43 | 114, 115 |
+
+- **The recording threads** waited for locks 31 % of their time in our code:
+  one lock held while any descriptor was made, one for the table of buffers.
+  Descriptor slots now have 256 locks and a check without one; looks at the
+  tables of buffers and textures share their locks, and each thread remembers
+  what it found last. Their time in our code went from 43 % to 34 % of the
+  clock, the waits in it from 31 % to 7 %.
+- **The bus, not the card's speed.** With every small copy in the PC's memory
+  the card took 73 ms for the title's lists, with those of 64 KB and more in
+  its own 52 ms: it reads the rest over PCI Express (3.0 x8 here).
+- **Objects let go while the card may use them** went through one list under
+  one lock; each thread has its own list now.
+- `crates/victory-gpu/src/turns.rs`: a switch set to `alt` (or `alt40`) goes on
+  and off by itself every 20 (40) seconds and says so in the log, so that one
+  run measures both in the same scene.
+- Read handles for DirectStorage, joined texture reads and counters of what
+  was dropped and why, in the log.
+- Merged: fxceless/victory-fork up to `465b94f5` (joined parts, gathered
+  indirect records, the frame rate in the picture), parts of Marvisak/VIctory's
+  open #929, #911 and #936.
+
+Tried, measured in turns, no gain, off by default: presents that return at once
+(`VICTORY_ASYNC_PRESENT`: 163 against 187 ms in one run, 120 against 121 in
+another); copied descriptor records looked for on a thread of their own
+(`VICTORY_SYNC_BESIDE`: 133 against 140); the heap's buffer views made at the
+submission (`VICTORY_HEAP_PASS_LATE`: 120 against 126; it makes new buffers
+visible a frame sooner, which the picture does not show).
 
 Switches used for the numbers above, besides the defaults:
-`VICTORY_AMBIENT=0.2 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1
-VICTORY_QUEUE2=1 VICTORY_COPY_PLAIN=1 VICTORY_WRITE_BEHIND=1
-VICTORY_TEXTURE_NO_WAIT=1 VICTORY_TEXTURE_SPILL=0 VICTORY_RELAY=2
-VICTORY_WIDE_REFRESH=1 VICTORY_WIDE_MERGE=1 VICTORY_WIDE_TEXTURES=1
+`VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_VIEW_KNOWN=1 VICTORY_INDIRECT_WINDOW=1
+VICTORY_INDIRECT_GATHER=1 VICTORY_JOIN_PARTS=1 VICTORY_COPY_AHEAD=1
+VICTORY_TITLE_PRIORITY_FLOOR=0 VICTORY_AMBIENT=0.2 VICTORY_LEVELS_ON_DEMAND=1
+VICTORY_TEXTURE_ROOM_PERCENT=95 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1
+VICTORY_COPY_PLAIN=1 VICTORY_WRITE_BEHIND=1 VICTORY_TEXTURE_NO_WAIT=1
+VICTORY_TEXTURE_SPILL=0 VICTORY_RELAY=2 VICTORY_WIDE_REFRESH=1
+VICTORY_WIDE_MERGE=1 VICTORY_WIDE_TEXTURES=1 VICTORY_WIDE_THREADS=4
 VICTORY_LAND_ASIDE=1 VICTORY_JOIN_COPIES=1 VICTORY_CARD_REHASH_RUNS=1
-VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`.
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024
+VICTORY_PIPELINE_WORKERS=10 VICTORY_PIPELINE_WORKERS_WORLD=3
+VICTORY_PIPELINE_WAIT_WORLD_MS=40 VICTORY_DRIVER_PROCESSORS=3`.
+
+Earlier the same day: people were black because the game's bounce light is ray
+traced and does not run here (`VICTORY_AMBIENT=0.2` puts a constant in its
+place) and because the card was full (`VICTORY_LEVELS_ON_DEMAND=1`).
 
 ### Corrections
 
+- **These are not the highest frame rates anyone has.** fxceless's fork, which
+  much of this comes from, reports 8 to 10 fps in the same rooms on an
+  i7-14700KF with an RTX 4070 (97 to 104 ms at about 3,850 draws). What can be
+  said of this one is that the same scene on the same PC went from 4.4 to 8.4.
+- **The audio row was too good**: a longer recording has one gap of 0.54 s.
+- Page runs mapped as one view (`VICTORY_MAP_RUNS`) broke faces and are off; a
+  read that failed uploaded zeros, which were black, and does not any more.
 - **The new code did not raise the typical frame rate.** 367 ms a frame
   against 329 ms in the best run before it. Preparing a frame went from 153 to
   98 ms, and other waits took its place. The shots compared are not exactly

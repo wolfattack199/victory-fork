@@ -100,36 +100,16 @@ static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
 /// turn, each change said in the log, for measuring it in one scene.
 #[cfg(windows)]
 fn present_behind() -> bool {
-    /// 0 off, 1 on, 2 in turn.
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| {
-        let asked = match std::env::var("VICTORY_ASYNC_PRESENT").as_deref() {
-            Ok("1") => 1,
-            Ok("alt") => 2,
-            _ => 0,
-        };
-        let mode = if asked != 0 && behind() && crate::host::late_free_present() { asked } else { 0 };
-        if mode != 0 {
+    static SWITCH: crate::turns::Switch = crate::turns::Switch::new("VICTORY_ASYNC_PRESENT", false, "presents behind the line");
+    static MAY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let may = *MAY.get_or_init(|| {
+        let may = SWITCH.ever() && behind() && crate::host::late_free_present();
+        if may {
             tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1; alt: in turn)");
         }
-        mode
+        may
     });
-    match mode {
-        0 => false,
-        1 => true,
-        _ => {
-            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
-            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
-                tracing::info!(
-                    "presents behind the line from now (VICTORY_ASYNC_PRESENT=alt): {}",
-                    if on { "ON" } else { "off, as usual" }
-                );
-            }
-            on
-        }
-    }
+    may && SWITCH.on()
 }
 
 /// With [`present_behind`]: puts the present of the next frame behind what

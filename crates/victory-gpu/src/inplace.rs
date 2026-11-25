@@ -391,6 +391,11 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether `at` lies in a view the runtime told us of.
+pub(crate) fn in_view(at: usize) -> bool {
+    views().views.range(..=at).next_back().is_some_and(|(&base, &(bytes, _, _))| at - base < bytes)
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

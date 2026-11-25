@@ -256,26 +256,215 @@ pub(crate) fn sync_heaps() {
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), and the microseconds it took; then the
+/// microseconds the submitting thread stood waiting for it
+/// ([`Syncing::end`]).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Whether [`sync_heaps`] runs on a thread of its own beside the
+/// submission's other preparation, which is waited for before anything
+/// goes to the card (`VICTORY_SYNC_BESIDE=1`; `0` before it, on the
+/// submitting thread; unsaid: beside where [`pass_late`] is on).
+///
+/// The two touch nothing of each other's: one makes descriptors from
+/// records, the other copies buffers and textures. In the world the pass is
+/// 27 ms a frame and the rest 75 (run m11), one after the other, with the
+/// card idle behind them 43 ms. Alone it gains nothing that run m16 could
+/// show (133 ms a frame without, 140 with).
+#[cfg(windows)]
+fn beside() -> bool {
+    static SWITCH: crate::turns::Switch = crate::turns::Switch::new(
+        "VICTORY_SYNC_BESIDE",
+        false,
+        "copied descriptor records are looked for beside the preparation",
+    );
+    // (With the buffer views made there too there is enough to gain.)
+    SWITCH.on() || (!SWITCH.said_off() && pass_late())
+}
+
+/// Whether the buffer views that shaders pick from a heap by an index they
+/// compute are made when the lists are submitted, beside their preparation
+/// ([`sync_begin`], `HostHeap::pick_up`), and not when the frame's first
+/// such list is recorded (`VICTORY_HEAP_PASS_LATE=1`).
+///
+/// Recorded, the pass looked at 13,700 slots a frame on one of the title's
+/// recording threads, 34 to 38 ms (run m15), and what the title wrote after
+/// it (records copied into the heap and their data, for the rest of the
+/// frame) was first seen a frame later: the slots were made null when the
+/// records were found at the submission, and real by the next frame's pass.
+#[cfg(windows)]
+pub(crate) fn pass_late() -> bool {
+    static SWITCH: crate::turns::Switch =
+        crate::turns::Switch::new("VICTORY_HEAP_PASS_LATE", false, "the heap's buffer views are made at the submission");
+    SWITCH.on()
+}
+
+/// Since the last frame line, of [`pick_up`]: passes that had slots to look
+/// at, the slots, the microseconds, the spans to bring up to date beyond
+/// the known ones and their bytes.
+#[cfg(windows)]
+pub(crate) static PICKED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// `HostHeap::pick_up` of every shader-visible heap: after [`sync_heaps`],
+/// whose records it makes.
+#[cfg(windows)]
+fn pick_up() -> Vec<host::Span> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !pass_late() {
+        return Vec::new();
+    }
+    let started = std::time::Instant::now();
+    let frame = crate::frame::current();
+    let mut fresh = Vec::new();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            fresh.extend(host.pick_up(|index| heap.handle(index), frame));
+        }
+    }
+    drop(heaps);
+    PICKED[0].fetch_add(1, Relaxed);
+    PICKED[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    PICKED[3].fetch_add(fresh.len() as u64, Relaxed);
+    PICKED[4].fetch_add(fresh.iter().map(|span| span.2 - span.1).sum(), Relaxed);
+    fresh
+}
+
+/// The spans of host copies that buffer views picked from the heaps are
+/// known to read, for the frame's one refresh of them all.
+#[cfg(windows)]
+pub(crate) fn picked_spans() -> Vec<host::Span> {
+    let mut spans = Vec::new();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.picked(&mut spans);
+        }
+    }
+    spans
+}
+
+/// The passes asked of the thread that runs [`sync_heaps`], and done by it.
+#[cfg(windows)]
+static PASSES: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+
+/// What the passes of that thread picked up and nothing has taken yet.
+#[cfg(windows)]
+static PICKED_UP: std::sync::Mutex<Vec<host::Span>> = std::sync::Mutex::new(Vec::new());
+
+/// A pass of [`sync_heaps`] (and [`pick_up`]) under way, by its number, or
+/// what one that is over picked up; [`Syncing::end`] waits for it.
+#[cfg(windows)]
+pub(crate) enum Syncing {
+    Under(u64),
+    Over(Vec<host::Span>),
+}
+
+/// Starts a pass of [`sync_heaps`] on its thread, or runs it here
+/// ([`beside`]). What it makes is there when [`Syncing::end`] returns.
+#[cfg(windows)]
+pub(crate) fn sync_begin() -> Syncing {
+    // Made on first use; without it the pass runs here.
+    static THREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let there = || {
+        *THREAD.get_or_init(|| {
+            std::thread::Builder::new()
+                .name("victory-sync".into())
+                .spawn(|| {
+                    loop {
+                        let asked = {
+                            let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+                            while passes.0 == passes.1 {
+                                passes = PASSES.1.wait(passes).unwrap_or_else(|e| e.into_inner());
+                            }
+                            passes.0
+                        };
+                        sync_heaps();
+                        let picked = pick_up();
+                        PICKED_UP.lock().unwrap_or_else(|e| e.into_inner()).extend(picked);
+                        PASSES.0.lock().unwrap_or_else(|e| e.into_inner()).1 = asked;
+                        PASSES.1.notify_all();
+                    }
+                })
+                .is_ok()
+        })
+    };
+    if !beside() || !there() {
+        sync_heaps();
+        return Syncing::Over(pick_up());
+    }
+    let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+    passes.0 += 1;
+    let asked = passes.0;
+    drop(passes);
+    PASSES.1.notify_all();
+    Syncing::Under(asked)
+}
+
+#[cfg(windows)]
+impl Syncing {
+    /// Waits until the pass is over, and makes the slots that waited for a
+    /// texture which has come meanwhile ([`make_waiting`]). Returns what it
+    /// picked up (`HostHeap::pick_up`), to be brought up to date.
+    pub(crate) fn end(self) -> Vec<host::Span> {
+        let asked = match self {
+            Syncing::Under(asked) => asked,
+            Syncing::Over(picked) => return picked,
+        };
+        let started = std::time::Instant::now();
+        let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+        while passes.1 < asked {
+            passes = PASSES.1.wait(passes).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(passes);
+        SYNCED[4].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        make_waiting();
+        std::mem::take(&mut *PICKED_UP.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [passes, slots, picking, spans, bytes] =
+        [0, 1, 2, 3, 4].map(|i| PICKED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if passes > 0.0 {
+        tracing::info!(
+            "buffer views shaders pick from the heap, made at the submission (VICTORY_HEAP_PASS_LATE=1), per frame: {passes:.1} passes \
+             over {slots:.0} slots, {:.2} ms, {spans:.1} spans ({:.1} MB) beyond the frame's refresh of the known ones",
+            picking / 1000.0,
+            bytes / 1e6
+        );
+    }
+    let [pages, looked, mirrored, micros, waited] =
+        [0, 1, 2, 3, 4].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
+    let kinds = host::COPIED_KINDS.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored ({:.0} no view, {:.0} \
+         constants, {:.0} other buffers, {:.0} textures), {:.0} left to the draws that read them through tables \
+         (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms, of which the submitting thread stood waiting {:.2} \
+         (VICTORY_SYNC_BESIDE=0: it is the one that does it)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
+        kinds[0],
+        kinds[1],
+        kinds[2],
+        kinds[3],
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        waited as f64 / 1000.0 / frames
     );
 }
 

@@ -207,6 +207,32 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// [`copy`] for bytes the title asked to be copied, whatever their number:
+/// not a question whether a page is there ([`LEAST`]). `VICTORY_COPY_SMALL=0`
+/// leaves those under [`LEAST`] to the kernel, as before.
+///
+/// 5,600 to 7,100 fills a frame of under 256 bytes (constants of one draw)
+/// each were a system call: 5 % of the submitting thread's time.
+pub(crate) fn copy_small(to: *mut u8, from: *const u8, len: usize) -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if len >= LEAST || !on() || !*SMALL.get_or_init(|| std::env::var_os("VICTORY_COPY_SMALL").is_none_or(|v| v != "0")) {
+        return copy(to, from, len);
+    }
+    if faulted_lately(from as usize, len) {
+        COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
@@ -229,6 +255,17 @@ mod tests {
     };
 
     const PAGE: usize = 4096;
+
+    #[test]
+    fn a_small_copy_is_made_in_place_too() {
+        let from: Vec<u8> = (0..200u32).map(|i| (i * 5 + 1) as u8).collect();
+        for len in [0, 1, 3, 16, 64, 200] {
+            let mut to = vec![0u8; 200];
+            assert!(guarded(to.as_mut_ptr(), from.as_ptr(), len));
+            assert_eq!(to[..len], from[..len]);
+            assert!(to[len..].iter().all(|&b| b == 0), "nothing past the end");
+        }
+    }
 
     #[test]
     fn memory_that_is_there_is_copied() {

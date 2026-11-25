@@ -145,7 +145,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File::new(file));
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -260,6 +260,58 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// Further handles of the same file that no read is using now
+    /// ([`File::read`]).
+    spare: Mutex<Vec<std::fs::File>>,
+}
+
+/// Whether reads of one file that run at the same time each have a handle of
+/// their own (`VICTORY_READ_HANDLES=0`: all go through the one the title's
+/// file object was opened with, as before).
+///
+/// Windows runs the reads of one handle one after another unless it was
+/// opened for overlapped ones: the twelve workers stood in line at the file
+/// with all the world's data while a disk that answers in 0.2 ms was idle
+/// nine tenths of the time, 3.7 ms a read.
+fn read_handles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_HANDLES").is_none_or(|v| v != "0"))
+}
+
+impl File {
+    fn new(file: std::fs::File) -> File {
+        File { file, spare: Mutex::new(Vec::new()) }
+    }
+
+    /// A further handle of the same file, whatever its name leads to now.
+    fn again(&self) -> Option<std::fs::File> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+        // SAFETY: an open handle of ours; the new one is nobody else's.
+        unsafe {
+            let handle = ReOpenFile(self.file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0);
+            (handle != INVALID_HANDLE_VALUE).then(|| std::fs::File::from_raw_handle(handle))
+        }
+    }
+
+    /// Runs `read` with a handle of the file no other read is using: there
+    /// are never more of them than workers. The one all share if no other
+    /// can be had (files of a kind that is not opened again).
+    fn read<R>(&self, read: impl FnOnce(&std::fs::File) -> R) -> R {
+        if !read_handles() {
+            return read(&self.file);
+        }
+        let spare = self.spare.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        match spare.or_else(|| self.again()) {
+            Some(file) => {
+                let result = read(&file);
+                self.spare.lock().unwrap_or_else(|e| e.into_inner()).push(file);
+                result
+            }
+            None => read(&self.file),
+        }
+    }
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -1038,21 +1090,21 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
+    let result = file.read(|file| {
+        let mut done = 0;
+        loop {
+            if done == out.len() {
+                break Ok(());
+            }
+            match file.seek_read(&mut out[done..], request.offset + done as u64) {
+                Ok(0) => break Err(END_OF_FILE),
+                Ok(n) => done += n,
+                Err(error) => break Err(from_win32(&error)),
+            }
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    });
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }
@@ -1227,6 +1279,38 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn reads_at_the_same_time_have_handles_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let bytes: Vec<u8> = (0..1u32 << 18).map(|i| (i * 7 + (i >> 9)) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::new(std::fs::File::open(&path).unwrap());
+        let shared = std::os::windows::io::AsRawHandle::as_raw_handle(&file.file) as usize;
+        let together = std::sync::Barrier::new(4);
+        std::thread::scope(|s| {
+            for n in 0..4usize {
+                let (file, bytes, together) = (&file, &bytes, &together);
+                s.spawn(move || {
+                    let offset = n * 1000;
+                    let mut out = vec![0u8; 5000];
+                    let handle = file.read(|f| {
+                        // All four hold a handle here.
+                        together.wait();
+                        f.seek_read(&mut out, offset as u64).unwrap();
+                        std::os::windows::io::AsRawHandle::as_raw_handle(f) as usize
+                    });
+                    assert_ne!(handle, shared);
+                    assert_eq!(out, bytes[offset..offset + 5000]);
+                });
+            }
+        });
+        // They are kept for the next reads, which open no more.
+        assert_eq!(file.spare.lock().unwrap().len(), 4);
+        file.read(|_| assert_eq!(file.spare.lock().unwrap().len(), 3));
+        assert_eq!(file.spare.lock().unwrap().len(), 4);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
