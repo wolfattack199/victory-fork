@@ -168,17 +168,22 @@ impl GraphicsState {
     /// refuses a pipeline that blends into a target of an integer format
     /// (`UINT` or `SINT`): the title does, and the console's GPU lets it
     /// (the blend is a no-op there). Blending is switched off for those
-    /// targets and kept for the others; with no integer target the state is
-    /// returned as it is.
+    /// targets and kept for the others; with no integer target that blends
+    /// the state is returned as it is (so a logic op on an integer target,
+    /// which D3D12 refuses together with independent blending, stays valid).
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
         let n = (self.targets.NumRenderTargets as usize).min(8);
-        let integer = |i: usize| integer_format(self.targets.RTFormats[i]);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        // Without independent blending, target 0's state stands for all.
+        let integer = |i: usize| {
+            integer_format(self.targets.RTFormats[i])
+                && self.blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool()
+        };
         if !(0..n).any(integer) {
             return blend;
         }
-        // Without independent blending, target 0's state stands for all.
-        if !blend.IndependentBlendEnable.as_bool() {
+        if !independent {
             let first = blend.RenderTarget[0];
             blend.RenderTarget = [first; 8];
             blend.IndependentBlendEnable = true.into();
@@ -1212,6 +1217,17 @@ mod tests {
         assert!(!b.RenderTarget[1].BlendEnable.as_bool());
         assert!(!b.RenderTarget[2].BlendEnable.as_bool());
 
+        // A logic op on an integer target, no blending: D3D12 refuses a logic
+        // op together with independent blending, so nothing is changed.
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].LogicOpEnable.as_bool());
+
         // No integer target among those in use (target 3 is past the count):
         // the state is returned as it is.
         let mut g = GraphicsState::default();
@@ -1266,6 +1282,14 @@ mod tests {
         };
         assert!(make(g.blend).is_err(), "this host makes a pipeline that blends into R32_UINT");
         assert!(make(g.host_blend()).is_ok(), "the host makes it without the blending");
+
+        // A logic op on the integer target, with no blending, is valid as it
+        // is; `host_blend` must not turn it into a state the host refuses.
+        g.blend.RenderTarget[0].BlendEnable = false.into();
+        g.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        assert!(make(g.blend).is_ok(), "the host makes a logic op on R32_UINT");
+        assert!(make(g.host_blend()).is_ok(), "and still does through host_blend");
     }
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
