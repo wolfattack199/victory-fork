@@ -394,6 +394,31 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The host pipeline of `this`, made on this thread now if no worker has made it yet (or
+/// waited for, if one is making it): for a dispatch, which waits for its pipeline rather than
+/// being dropped ([`compute_waits`]).
+#[cfg(windows)]
+pub(crate) fn host_pipeline_now<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    make::now(p);
+    make::ready(p)
+}
+
+/// Whether a dispatch whose pipeline is still being made after the frame's wait waits for it
+/// (`VICTORY_COMPUTE_WAIT=0`: it is dropped, as before). A draw dropped for a frame leaves a
+/// hole in that frame; a dropped dispatch leaves what it should have computed unwritten, and
+/// later passes, frames and the title read that (skinning, culling, particle state, the
+/// ray-tracing builder's stages). The same rule as XCL's: graphics draws nothing until its
+/// pipeline is made, compute is waited for.
+#[cfg(windows)]
+pub(crate) fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

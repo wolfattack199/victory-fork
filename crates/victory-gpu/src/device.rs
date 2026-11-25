@@ -346,16 +346,19 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 and 0x218 (`SLOT`, slots 57 and 67):
+/// `DeserializeGraphicsPipelineStateX` and `DeserializeComputePipelineStateX`
+/// (as XCL names them), which make a pipeline from the console driver's own
+/// serialized form of it. The title calls both (title+0x2477578 and
+/// title+0x24800d5) as `(this, serialized state, interface id, out)` and, when
+/// they fail, makes the pipeline from its description through the methods we
+/// have: its upscaler says so in its log ("DeserializeComputePipelineStateX
+/// FAILED ... falling back"), and a world made of tens of thousands of these
+/// calls' pipelines draws whole. So they fail, with `out` null, as XCL's do;
+/// the first call of each logs the serialized state's first words.
+/// shortcut: the console driver's form is not read. Answering `S_OK` here
+/// without making the pipeline would hand the title whatever its stack held
+/// as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -369,7 +372,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
+    if calls == 1 || calls.is_power_of_two() && tracing::enabled!(tracing::Level::DEBUG) {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
         #[cfg(windows)]
@@ -388,12 +391,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::info!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a console pipeline cache entry refused (Deserialize*PipelineStateX): the title makes the pipeline from its description instead"
         );
     }
     E_NOTIMPL

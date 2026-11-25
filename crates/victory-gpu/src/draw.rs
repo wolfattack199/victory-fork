@@ -429,6 +429,8 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Dispatches that waited for their pipeline after the frame's wait ([`State::dispatch`]).
+pub(crate) static COMPUTE_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -2031,7 +2033,20 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let made = crate::pipeline::host_pipeline(self.pipeline as This).or_else(|| {
+            if !crate::pipeline::compute_waits() {
+                return None;
+            }
+            let started = std::time::Instant::now();
+            let made = crate::pipeline::host_pipeline_now(self.pipeline as This);
+            COMPUTE_WAITS.fetch_add(1, Ordering::Relaxed);
+            once!(
+                ms = started.elapsed().as_millis() as u64,
+                "a dispatch waited for its pipeline to be made instead of being dropped (VICTORY_COMPUTE_WAIT=0 drops it)"
+            );
+            made
+        });
+        let Some(p) = made else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"

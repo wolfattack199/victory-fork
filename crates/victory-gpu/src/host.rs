@@ -118,6 +118,18 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Memory this process could still commit (what the system's commit limit, RAM and page file,
+/// has left), from `GlobalMemoryStatusEx`.
+pub(crate) fn available_commit() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPageFile)
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.

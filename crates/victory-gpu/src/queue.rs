@@ -585,13 +585,21 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane: frame token, the plane's resources, then where they
+/// come from and go (source rectangles, destination placement) and four
+/// words (colour space, scale filter, flags) that are zero in the title's
+/// presents. 72 bytes, the stride of the title's plane array (seen in its
+/// two-plane presents: the second plane's token and count at word 9).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const u8,
+    destination: *const u8,
+    rest: [u64; 4],
 }
+const _: () = assert!(size_of::<Plane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -815,6 +823,8 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    note_planes(planes, plane_parameters);
+    #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -839,6 +849,43 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Logs the planes a present names (how many, and each one's resources'
+/// sizes and formats) whenever that layout changes: only the first
+/// resource of the first plane is shown ([`present`]).
+#[cfg(windows)]
+fn note_planes(planes: u32, plane_parameters: *const Plane) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut layout = format!("{planes} planes:");
+    for i in 0..planes.min(4) as usize {
+        // SAFETY: the title passes `planes` plane descriptions.
+        let Some(plane) = (unsafe { plane_parameters.add(i).as_ref() }) else {
+            break;
+        };
+        layout.push_str(&format!(" [{} resources", plane.count));
+        let listed = if plane.resources.is_null() {
+            0
+        } else {
+            plane.count.min(4) as usize
+        };
+        for r in 0..listed {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources.add(r) };
+            match crate::resource::texture_size(resource) {
+                Some((width, height, format)) => {
+                    layout.push_str(&format!(" {width}x{height} f{format}"));
+                }
+                None => layout.push_str(" (no texture)"),
+            }
+        }
+        layout.push(']');
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != layout {
+        tracing::info!(frame = FRAMES.load(Ordering::Relaxed), "present: {layout}");
+        *last = layout;
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
