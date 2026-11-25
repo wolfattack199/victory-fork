@@ -740,6 +740,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn list_scratch_grows_to_fit() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let sizes = || {
+            let s = list.scratch.lock().unwrap();
+            s.chunks.iter().map(|c| c.1).collect::<Vec<_>>()
+        };
+        let first = list.scratch(1).unwrap();
+        let second = list.scratch(1).unwrap();
+        assert_eq!(second.0 - first.0, 256);
+        assert_eq!(second.1 as usize - first.1 as usize, 256);
+        assert!(list.scratch(u64::MAX).is_none());
+        assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
+        if scratch_pool() {
+            assert_eq!(sizes(), [SCRATCH_FIRST]);
+            list.scratch(SCRATCH_FIRST).unwrap();
+            assert_eq!(sizes(), [SCRATCH_FIRST, 2 * SCRATCH_FIRST]);
+            // At least what is asked, at most a whole chunk.
+            let most = SCRATCH_CHUNK;
+            list.scratch(most).unwrap();
+            list.scratch(1).unwrap();
+            assert_eq!(sizes(), [SCRATCH_FIRST, 2 * SCRATCH_FIRST, most, most]);
+        } else {
+            assert_eq!(sizes(), [SCRATCH_CHUNK]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        // Shared chunks went back for the next list; a list's own are used
+        // again from the front.
+        if scratch_pool() {
+            assert!(sizes().is_empty());
+        } else {
+            assert_eq!(list.scratch(512).unwrap(), first);
+        }
+        list.close();
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1515,7 +1554,8 @@ impl Drop for Scratch {
 const SCRATCH_CHUNK: u64 = 4 << 20;
 /// A list's first chunk when the chunks are shared ([`scratch_pool`]): most
 /// lists put a few constants or a rectangle's corners there, and every
-/// list that did took 4 MiB of the PC's memory for it.
+/// list that did took 4 MiB of the PC's memory for it. Each next chunk is
+/// twice the last (at least what is asked), up to [`SCRATCH_CHUNK`].
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
@@ -1578,7 +1618,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         return Some(chunk);
     }
     let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    name(&buffer, || format!("list scratch {size:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
@@ -5268,7 +5308,7 @@ impl HostList {
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -5278,17 +5318,22 @@ impl HostList {
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
-        // next one (a list's first chunk may be a small one).
+        // next one (the chunks of shared scratch grow).
         while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
-                SCRATCH_FIRST
+            let size = if scratch_pool() {
+                // Powers of two, so that kept chunks fit the next list's asks.
+                let next = s.chunks.last().map_or(SCRATCH_FIRST, |c| 2 * c.1);
+                next.max(len.next_power_of_two()).min(SCRATCH_CHUNK)
             } else {
                 SCRATCH_CHUNK
             };
             let chunk = take_chunk(host, size)?;
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                chunk = s.current, requested = len, size, "took list scratch");
             s.chunks.push((chunk, size));
             s.used = 0;
         }
