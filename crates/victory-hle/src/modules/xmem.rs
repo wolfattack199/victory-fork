@@ -493,11 +493,61 @@ fn view_pages() -> usize {
 }
 
 /// Whether the GPU's page-mapping copies map a run of consecutive pages of
-/// one section as one view (`VICTORY_MAP_RUNS=0`: page by page, as before).
+/// one section as one view (`VICTORY_MAP_RUNS=1`; off by default).
 /// After pull request #823 by Felix2180.
+///
+/// It was on, and upstream measured the same thing (its README of
+/// 2026-11-25): faces black or red in 3 launches of 3 with it, in none of 6
+/// without. A page taken out of a longer view takes its neighbours away for
+/// a moment too, and what read them in that moment found nothing there.
 fn map_runs() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_none_or(|v| v != "0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_some_and(|v| v == "1"));
     *ON
+}
+
+/// Raises the calling thread above the title's others for as long as it
+/// changes what title memory shows, and puts it back when dropped
+/// (`VICTORY_MAP_PRIORITY=0`: not).
+///
+/// The title maps its streamed pages on threads below the ordinary
+/// priority, which on the console have a processor to themselves. Here
+/// every processor is taken, and such a thread held the page table's lock
+/// and the one that keeps reads in place away while it was ready to run
+/// and not run: 63 % of the time ready, 3 % on a processor, with the
+/// title's own recording thread and the layer's readers waiting for it
+/// (views unmapped in 0.02 ms each while loading and 0.5 to 1.9 ms in the
+/// world).
+struct Raised(Option<i32>);
+
+impl Raised {
+    fn new() -> Self {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_PRIORITY").is_none_or(|v| v != "0"));
+        if !*ON {
+            return Self(None);
+        }
+        // SAFETY: the calling thread's own priority.
+        unsafe {
+            let was = GetThreadPriority(GetCurrentThread());
+            // (Also the answer for "not known", which is above all of them.)
+            if was >= THREAD_PRIORITY_TIME_CRITICAL || SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) == 0 {
+                return Self(None);
+            }
+            Self(Some(was))
+        }
+    }
+}
+
+impl Drop for Raised {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+        if let Some(was) = self.0 {
+            // SAFETY: as above.
+            unsafe { SetThreadPriority(GetCurrentThread(), was) };
+        }
+    }
 }
 
 /// Whether writes into physical pages go through the view of a whole section
@@ -825,6 +875,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     let base = address as usize;
     let called = std::time::Instant::now();
     let _counted = Counted(called);
+    // Until the locks below are let go: declared first, dropped last.
+    let _raised = Raised::new();
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
@@ -911,6 +963,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let called = std::time::Instant::now();
+    let _raised = Raised::new();
     let mut physical = physical();
     mapped_us(6, called);
     mapped(2, 1);

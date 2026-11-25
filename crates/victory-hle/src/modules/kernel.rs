@@ -294,6 +294,40 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// The priority a title thread gets for the one it asks for: one below the
+/// ordinary is raised to `floor`. Idle threads and the background mode's
+/// marks are left as they are.
+fn floored(priority: i32, floor: Option<i32>) -> i32 {
+    match floor {
+        Some(floor) if (-2..0).contains(&priority) => priority.max(floor.min(0)),
+        _ => priority,
+    }
+}
+
+/// The console's title threads below the ordinary priority (the ones that
+/// stream, map pages and read files) share processors that are theirs. Here
+/// they share all processors with the title's other threads, ours and the
+/// system's, and where every processor is taken a thread one step below the
+/// rest is not run at all for most of the time: 63 % of it ready to run, 3 %
+/// on a processor, with the textures it brings as late as that.
+/// `VICTORY_TITLE_PRIORITY_FLOOR=0`: no title thread but an idle one is
+/// below the ordinary priority; unset, as the title asks.
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static FLOOR: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_TITLE_PRIORITY_FLOOR").ok().and_then(|v| v.trim().parse().ok())
+    });
+    let given = floored(priority, floor);
+    if given != priority {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(priority, given, so_far = n, "a title thread below the ordinary priority is raised (VICTORY_TITLE_PRIORITY_FLOOR)");
+        }
+    }
+    host::set_thread_priority(thread, given)
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -406,6 +440,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -510,6 +545,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -605,6 +645,10 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_thread_priority(_thread: *mut c_void, _priority: i32) -> i32 {
+        1
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -619,6 +663,17 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_threads_below_the_ordinary_priority_are_raised() {
+        for (priority, given) in [(-1, 0), (-2, 0), (0, 0), (2, 2), (15, 15), (-15, -15), (0x1_0000, 0x1_0000), (0x2_0000, 0x2_0000)] {
+            assert_eq!(floored(priority, Some(0)), given, "{priority}");
+            assert_eq!(floored(priority, None), priority);
+        }
+        assert_eq!(floored(-2, Some(-1)), -1);
+        // A floor above the ordinary priority raises none above it.
+        assert_eq!(floored(-1, Some(2)), 0);
+    }
 
     #[test]
     fn title_images_report_their_original_path() {

@@ -1058,9 +1058,12 @@ fn note_written(g: &mut Guards, start: usize, end: usize) {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// Unset or `all`: everything. `guards`: bit 1 alone (the default until
+/// the slots were counted: 6,165 of 20,109 texture slots in 25 minutes, and
+/// 4,451 of 14,841 in three, were uploaded before the title's read had
+/// filled them and kept what was there before, until a look frames later
+/// happened on it). `0`: nothing, counted only (the default until run 199).
+/// `1`: bits 1 and 2. `slots`: bit 2 alone.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -1072,8 +1075,8 @@ pub(crate) fn page_writes() -> u8 {
         Ok("0") => 0,
         Ok("1") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
+        Ok("guards") => 1,
+        _ => 7,
     })
 }
 

@@ -324,15 +324,24 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// A texture that was never read is not left: its staging buffer is zeros,
+/// and the list that names it uploads them, black, over what the texture
+/// showed. A texture picked by index has a new staging buffer for every
+/// upload, and the print its slot is checked against is of the memory as it
+/// is, not of the zeros that went up, so it stayed black until the title
+/// wrote it again (16 such refreshes a frame in the opening cutscene). Its
+/// refresh waits for the lock.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// through the kernel because title memory was being remapped, those left
+/// for the next refresh because a page was not there, and those that waited
+/// after that because the texture had never been read.
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -1009,10 +1018,14 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None => match self.refresh_unlocked(last, size) {
+                    Some(read) => return read,
+                    // Nothing of it was ever read: waited for after all.
+                    None => waited(2, crate::watch::title_memory_reading),
+                },
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1024,8 +1037,10 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // (And at most about half a second: 30 frames were four seconds
+            // where the title begins eight a second.)
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + crate::frame::frames_in(500, 30)) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1087,8 +1102,9 @@ impl Staging {
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    /// Returns the bytes read; `None` if that is nothing and the staging
+    /// buffer holds nothing of the texture from before either.
+    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
@@ -1103,13 +1119,16 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            last.quiet = None;
-            0
+            return Some(size);
         }
+        last.asked = 0;
+        last.quiet = None;
+        if !self.own.load(Relaxed) {
+            UNLOCKED[2].fetch_add(1, Relaxed);
+            return None;
+        }
+        UNLOCKED[1].fetch_add(1, Relaxed);
+        Some(0)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.

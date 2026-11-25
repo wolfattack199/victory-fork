@@ -8492,11 +8492,12 @@ impl Meter {
                 guards[8] / 1e3,
                 guards[9]
             );
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
+            let [through, left, waited] = [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + waited > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                     {waited:.1} waited for after that (never read before: they went up as zeros)"
                 );
             }
         }

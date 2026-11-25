@@ -402,8 +402,23 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
+/// memory is looked at again, each counted from the look before: at most,
+/// and the milliseconds they are at 60 frames a second. (In frames alone
+/// the five looks were half a second to a minute apart where the title
+/// begins eight a second: a texture uploaded before the title had filled it
+/// was found 4, 16 or 56 frames later, 216,000 times in 25 minutes.)
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// The wait before the `look`-th look of [`RECHECK_FRAMES`], in frames.
+fn recheck_after(look: usize) -> Option<u64> {
+    let most = *RECHECK_FRAMES.get(look)?;
+    Some(crate::frame::frames_in(most * 1000 / 60, most))
+}
+
+/// Looks at a texture picked by index that found none of its memory mapped
+/// while the runtime was changing what is mapped (the page may be there
+/// again a moment later): looked at again, not let go.
+pub(crate) static HEAP_TEXTURES_UNSURE: AtomicU64 = AtomicU64::new(0);
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1856,7 +1871,7 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if part_of_pass(1, || crate::texture::fingerprint(at, len)) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match recheck_after(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
@@ -1881,7 +1896,16 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                // The runtime unmaps a whole view to change a page of it:
+                // what is not there while it does may be there again.
+                let still = crate::watch::title_memory_reading_now();
                 let mapped = part_of_pass(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
+                if mapped == 0 && still.is_none() {
+                    HEAP_TEXTURES_UNSURE.fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_later(index, write, frame, 1);
+                    continue;
+                }
+                drop(still);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1992,7 +2016,7 @@ impl State {
             // title mapped: again in 120 frames, as before).
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                None => (!whole).then(|| (frame + crate::frame::frames_in(2000, 120), 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -2029,7 +2053,8 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = part_of_pass(6, || crate::texture::fingerprint(at, len));
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    let wait = recheck_after(0).unwrap_or(1);
+                    host.texture_slot_recheck(index, write, frame + wait, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

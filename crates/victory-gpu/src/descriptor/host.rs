@@ -375,9 +375,10 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Frames from the pass that takes a written range to the look at its
-/// slots: the levels of one texture arrive in a few requests, and a look
-/// two frames on takes those of the next frame with it.
-const PAGE_WRITE_AFTER: u64 = 2;
+/// slots: the next one, as for memory mapped. (Two, so that the requests of
+/// the next frame, the other levels of the texture, were looked at with it:
+/// a quarter of a second at eight frames a second.)
+const PAGE_WRITE_AFTER: u64 = 1;
 
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
@@ -3771,7 +3772,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
 
     /// A write behind the guards' back under a placed texture: a slot
     /// waiting for its first upload is left alone, one uploaded before is
-    /// counted, and made due two frames on when that is asked for. (The
+    /// counted, and made due a frame on when that is asked for. (The
     /// ranges are handed over here, not through the list all heaps share.)
     #[test]
     fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
@@ -3797,10 +3798,10 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Under it, counted only: it stays out of the queue.
         assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
-        // Under it, asked for: due two frames on, not before.
+        // Under it, asked for: due a frame on, not before.
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
-        assert_eq!(slots(61), []);
-        assert_eq!(slots(62), [1]);
+        assert_eq!(slots(60), []);
+        assert_eq!(slots(61), [1]);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

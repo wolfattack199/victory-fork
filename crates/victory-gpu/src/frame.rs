@@ -84,6 +84,36 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// The frames the title began in the last half second or more: the moment
+/// and the frame counted from, and frames per thousand seconds.
+static RATE: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
+
+/// About how many frames the title begins in `ms` milliseconds at the pace
+/// of the last half second, 1 at least and `most` at most.
+///
+/// Waits meant as a moment were counted in frames: four frames are 66 ms at
+/// 60 a second, and half a second where the title begins eight.
+pub(crate) fn frames_in(ms: u64, most: u64) -> u64 {
+    let now = Instant::now();
+    let frame = current();
+    let mut rate = RATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, from, milli) = *rate.get_or_insert((now, frame, 60_000));
+    let gone = now.saturating_duration_since(since).as_millis() as u64;
+    let milli = if gone >= 500 {
+        let measured = frame.saturating_sub(from).saturating_mul(1_000_000) / gone;
+        *rate = Some((now, frame, measured));
+        measured
+    } else {
+        milli
+    };
+    frames_at(milli, ms, most)
+}
+
+/// [`frames_in`] at `milli` frames per thousand seconds.
+fn frames_at(milli: u64, ms: u64, most: u64) -> u64 {
+    (milli.saturating_mul(ms) / 1_000_000).clamp(1, most.max(1))
+}
+
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
 static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -207,6 +237,20 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_moment_is_fewer_frames_at_a_slow_pace() {
+        // 60 a second: what the counts of frames were meant as.
+        assert_eq!(frames_at(60_000, 67, 4), 4);
+        assert_eq!(frames_at(60_000, 2000, 120), 120);
+        // 8 a second: the same moments.
+        assert_eq!(frames_at(8_000, 67, 4), 1);
+        assert_eq!(frames_at(8_000, 500, 30), 4);
+        assert_eq!(frames_at(8_000, 2000, 120), 16);
+        // Never none, never more than asked; a title that stands still.
+        assert_eq!(frames_at(0, 500, 30), 1);
+        assert_eq!(frames_at(1_000_000, 2000, 120), 120);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
