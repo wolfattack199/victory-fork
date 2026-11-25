@@ -281,7 +281,9 @@ pub struct HostShader {
     /// the host shows the shader a 16-bit float or signed buffer view at
     /// these places as the unsigned format of the same layout.
     /// shortcut: a view in a normalised 16-bit format, whose values the
-    /// console would convert to halves, is read as its integers.
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
     pub half_views: Vec<(u8, u32)>,
 }
 

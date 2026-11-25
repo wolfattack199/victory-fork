@@ -5688,7 +5688,7 @@ impl<'a> Lower<'a> {
                 {
                     // (Unsigned integers where the access moves halves.)
                     let halves = un.contains("_format_d16_")
-                        && used.is_some_and(|u| u.root == RootType::Table);
+                        && self.table_place(&Source::Loaded { load: site, first }).is_some();
                     (10 | u, if halves { 0x405 } else { 0x409 })
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
@@ -6187,6 +6187,22 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
@@ -10631,9 +10647,10 @@ impl<'a> Lower<'a> {
         // they are, as unsigned integers, and the host is told, which shows
         // the shader a 16-bit float view there as its unsigned twin
         // ([`super::HostShader::half_views`]).
-        let halves = d16 && typed && used.is_some_and(|u| u.root == RootType::Table);
-        if halves && let Some(u) = used {
-            self.half_views.insert((u.slot, u.table_offset_dwords));
+        let place = (d16 && typed).then(|| self.table_place(src)).flatten();
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
         }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
@@ -10958,12 +10975,15 @@ impl<'a> Lower<'a> {
             if halves {
                 let h = self.handle(site, src, false, (10 | u, 0x405))?;
                 let i32t = self.s.t.i32;
-                let ret = self
-                    .s
-                    .m
-                    .named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
-                self.s
-                    .op(c, "bufferLoad.i32", Attr::ReadOnly, ret, 68, &[h, index, iu])
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
             } else {
                 let h = self.handle(site, src, false, (10 | u, 0x409))?;
                 self.s.op(
