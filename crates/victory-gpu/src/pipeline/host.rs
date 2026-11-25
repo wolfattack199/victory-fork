@@ -91,6 +91,49 @@ impl Default for GraphicsState {
     }
 }
 
+/// Whether `format` is an integer (UINT/SINT) render target format, which
+/// the host cannot blend.
+fn integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format.0,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+    )
+}
+
+impl GraphicsState {
+    /// The blend description for the host: blending off for integer render
+    /// targets. The console's blender passes integer targets through; D3D12
+    /// calls blending one an error (debug layer message 676, "The render
+    /// target format at slot 2 is format (R8_UINT). This format does not
+    /// support blending": a G-buffer pass of Grand Theft Auto VI), and what
+    /// NVIDIA's driver writes there is undefined. Without independent blend
+    /// the first slot's description holds for all, so it is spread to every
+    /// slot first. `VICTORY_FIX_INTBLEND=0`: the title's description as is.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        if std::env::var_os("VICTORY_FIX_INTBLEND").is_some_and(|v| v == "0") {
+            return blend;
+        }
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        let blends = |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        if !(0..n).any(|i| integer_format(self.targets.RTFormats[i]) && blends(i)) {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in 0..n {
+            if integer_format(self.targets.RTFormats[i]) {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                blend.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+        blend
+    }
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -634,7 +677,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -881,7 +924,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +943,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1115,7 +1158,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1315,5 +1358,60 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn state(formats: &[i32], independent: bool, enable: &[bool]) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = formats.len() as u32;
+        for (i, &f) in formats.iter().enumerate() {
+            g.targets.RTFormats[i] = DXGI_FORMAT(f);
+        }
+        g.blend.IndependentBlendEnable = independent.into();
+        for (i, &e) in enable.iter().enumerate() {
+            g.blend.RenderTarget[i].BlendEnable = e.into();
+        }
+        g
+    }
+
+    #[test]
+    fn float_targets_keep_the_title_blend() {
+        // R8G8B8A8_UNORM, R16G16B16A16_FLOAT
+        let g = state(&[28, 10], false, &[true]);
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn an_integer_target_under_shared_blend_turns_off_there_only() {
+        // UNORM, UNORM, R8_UINT under one shared, enabled blend.
+        let g = state(&[28, 28, 62], false, &[true]);
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1].SrcBlend, g.blend.RenderTarget[0].SrcBlend);
+    }
+
+    #[test]
+    fn independent_blend_turns_off_only_the_integer_slot() {
+        let g = state(&[28, 57], true, &[true, true]);
+        let b = g.host_blend();
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn an_integer_target_that_does_not_blend_changes_nothing() {
+        let g = state(&[28, 62], true, &[true, false]);
+        let b = g.host_blend();
+        assert_eq!(b.RenderTarget[1].BlendEnable, g.blend.RenderTarget[1].BlendEnable);
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
     }
 }
