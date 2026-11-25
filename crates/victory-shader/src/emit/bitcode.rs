@@ -448,6 +448,20 @@ impl Module {
         };
         self.push(block, ret, Op::Call(i, args))
     }
+    /// A copy of the call `v` at the end of `block`, with the argument `from`
+    /// replaced by `to`; `None` if `v` is no call or has no such argument.
+    pub fn call_with(&mut self, block: usize, v: V, from: V, to: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let Inst { ty, op: Op::Call(f, args) } = &self.insts[i as usize] else {
+            return None;
+        };
+        if !args.contains(&from) {
+            return None;
+        }
+        let (ty, f) = (*ty, *f);
+        let args = args.iter().map(|&a| if a == from { to } else { a }).collect();
+        Some(self.push(block, ty, Op::Call(f, args)))
+    }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
         let i = self.insts.len() as u32;

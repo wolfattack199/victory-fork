@@ -6173,6 +6173,12 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            // The same immediate sampler on every path is that sampler.
+            Source::Phi { args, .. }
+                if sampler && matches!(&args[..], [Source::Constant(w), rest @ ..] if rest.iter().all(|a| matches!(a, Source::Constant(x) if x == w))) =>
+            {
+                self.handle(site, &args[0], sampler, props)
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6204,6 +6210,51 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// A sampler chosen by control flow between two immediate samplers (the
+    /// title picks an address mode this way): the handles of the two, and a
+    /// bit made at the join that is set where the second was chosen. A
+    /// handle cannot be chosen by control flow and a shader sampler range
+    /// cannot span two static samplers, so the sample is made through each
+    /// and the result picked ([`Self::image`]). `None` for any other source.
+    fn immediate_sampler_pair(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<Option<(V, V, V)>, Why> {
+        let Source::Phi { block, args } = src else {
+            return Ok(None);
+        };
+        let Some(words) = args
+            .iter()
+            .map(|a| match a {
+                Source::Constant(w) => Some(w.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let first = words[0].clone();
+        let Some(second) = words.iter().find(|w| **w != first).cloned() else {
+            return Ok(None);
+        };
+        if words.iter().any(|w| *w != first && *w != second) {
+            return Ok(None);
+        }
+        let a = self.handle(site, &Source::Constant(first), true, props)?;
+        let b = self.handle(site, &Source::Constant(second.clone()), true, props)?;
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, w) in p.blocks[*block].preds.iter().zip(&words) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            incoming.push((self.s.m.bool(*w == second), at));
+        }
+        let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+        let take_b = self.s.m.phi(join, self.s.t.i1);
+        self.s.m.set_phi(take_b, incoming);
+        Ok(Some((a, b, take_b)))
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -9485,6 +9536,10 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        // Two immediate samplers ([`Self::immediate_sampler_pair`]): their
+        // handles and the pick, and the result through the second.
+        let mut other: Option<(V, V, V)> = None;
+        let mut alt: Option<V> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -9497,7 +9552,16 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sampler_props = (14 | if cmp { 0x8000 } else { 0 }, 0);
+            // Two immediate samplers chosen by control flow: the sample
+            // through `sh`, then the same through the other (below).
+            let sh = match self.immediate_sampler_pair(site, ss, sampler_props)? {
+                Some((a, b, take_b)) => {
+                    other = Some((a, b, take_b));
+                    a
+                }
+                None => self.handle(site, ss, true, sampler_props)?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9566,7 +9630,7 @@ impl<'a> Lower<'a> {
                 let (lx, ly, lz) = (at(0), at(1), at(2));
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
+                    let mut lod = self.s.op(
                         c,
                         "calculateLOD.f32",
                         Attr::ReadOnly,
@@ -9574,6 +9638,11 @@ impl<'a> Lower<'a> {
                         81,
                         &[h, sh, lx, ly, lz, clamped],
                     );
+                    if let Some((a, b, take_b)) = other
+                        && let Some(lod_b) = self.s.m.call_with(c, lod, a, b)
+                    {
+                        lod = self.s.m.select(c, take_b, lod_b, lod);
+                    }
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -9908,6 +9977,9 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
+        if let Some((a, b, _)) = other {
+            alt = self.s.m.call_with(c, r, a, b);
+        }
         let channels: Vec<u32> = if op == 73 {
             vec![0, 1, 2, 3]
         } else {
@@ -9917,7 +9989,16 @@ impl<'a> Lower<'a> {
         for ch in channels {
             let x = match gathered {
                 Some(g) => g[ch as usize],
-                None => self.s.m.extract(c, r, ch),
+                None => {
+                    let x = self.s.m.extract(c, r, ch);
+                    match (alt, other) {
+                        (Some(rb), Some((_, _, take_b))) => {
+                            let y = self.s.m.extract(c, rb, ch);
+                            self.s.m.select(c, take_b, y, x)
+                        }
+                        _ => x,
+                    }
+                }
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
