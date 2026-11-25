@@ -841,12 +841,29 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     post
 }
 
-/// Recomputes every block's predecessors from the exits.
+/// Recomputes reachable blocks' predecessors from reachable exits and clears
+/// unreachable blocks so dead edges cannot pollute `preds` or SSA renaming.
 fn link(blocks: &mut [Block]) {
-    for block in blocks.iter_mut() {
-        block.preds.clear();
+    if blocks.is_empty() {
+        return;
     }
-    for b in 0..blocks.len() {
+    let order = reverse_postorder(blocks);
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        block.preds.clear();
+        if !reachable[b] {
+            block.insts.clear();
+            block.phis.clear();
+            block.exit = Exit::End;
+        }
+    }
+    for (b, &live) in reachable.iter().enumerate() {
+        if !live {
+            continue;
+        }
         for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
         }
@@ -938,7 +955,8 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
         let Some((from, _)) = irreducible_edge(blocks, &order, &index) else {
             return Ok(());
         };
-        let found = multi_entry_loop(blocks, &vec![true; blocks.len()]);
+        let reachable: Vec<bool> = index.iter().map(|&i| i != usize::MAX).collect();
+        let found = multi_entry_loop(blocks, &reachable);
         let Some((region, mut entries)) = found.filter(|_| blocks.len() < limit) else {
             return Err(ShaderError::Unsupported {
                 offset: blocks[from].offset,
@@ -1787,5 +1805,43 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn unreachable_block_falling_through_to_live_block_does_not_corrupt_ssa() {
+        // 0: s_branch +1 -> jumps over the unreachable s_mov at offset 4 into offset 8.
+        let p = build_words(
+            &[
+                0xBF82_0001, // 0: s_branch +1 (-> 8)
+                0xBE81_0381, // 4: s_mov_b32 s1, 1 (unreachable, falls through to 8)
+                0xBE80_0300, // 8: s_mov_b32 s0, s0
+                S_ENDPGM,    // 12: s_endpgm
+            ],
+            false,
+        );
+        let target = p.blocks.iter().find(|b| b.offset == 8).expect("live target block");
+        assert_eq!(target.preds, [0]);
+        assert!(target.phis.is_empty());
+        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.inputs[0].0, Reg::S(0));
+        assert_eq!(target.insts[0].read(Reg::S(0)), Some(p.inputs[0].1));
+    }
+
+    #[test]
+    fn unreachable_block_branching_to_entry_does_not_break_entry_inputs() {
+        // 8: dead s_branch -3 targeting offset 0 after s_endpgm.
+        let p = build_words(
+            &[
+                0xBE80_0300, // 0: s_mov_b32 s0, s0
+                S_ENDPGM,    // 4: s_endpgm
+                0xBF82_FFFD, // 8: s_branch -3 (-> 0, unreachable)
+            ],
+            false,
+        );
+        assert!(p.blocks[0].preds.is_empty());
+        assert!(p.blocks[0].phis.is_empty());
+        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.inputs[0].0, Reg::S(0));
+        assert_eq!(p.blocks[0].insts[0].read(Reg::S(0)), Some(p.inputs[0].1));
     }
 }
