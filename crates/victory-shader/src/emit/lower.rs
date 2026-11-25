@@ -3591,6 +3591,22 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // On host waves of 32 that do not exchange (a console wave64 run
+            // as halves) `lane_bit` takes the host lane, so both waves would
+            // test the low dword: only a constant with equal dwords is exact.
+            Atom::Opaque(_)
+                if self.console_lanes && self.exchange.is_none() && self.halves.is_some() =>
+            {
+                Err("an opaque lane mask in a half-wave")
+            }
+            Atom::Constant(k)
+                if self.console_lanes
+                    && self.exchange.is_none()
+                    && self.halves.is_some()
+                    && k as u32 != (k >> 32) as u32 =>
+            {
+                Err("a constant lane mask in a half-wave")
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -4308,10 +4324,12 @@ impl<'a> Lower<'a> {
     /// wave operations leave helper lanes out (DXIL before
     /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
     /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
-    /// loop runs to its iteration limit in every such lane (at [`LOOP_LIMIT`]:
-    /// draws of 0.3 to 1.3 s each, then DEVICE_HUNG). With its own value a
-    /// helper lane matches in the first pass and leaves; what a helper lane
-    /// computes only feeds derivatives, and its stores are dropped.
+    /// loop runs to its iteration limit in every such lane (upstream, at
+    /// [`LOOP_LIMIT`]: draws of 0.3 to 1.3 s each, then DEVICE_HUNG; here a
+    /// pixel loop stops after 128 passes, in every such lane). With its own
+    /// value a helper lane matches in the first pass and leaves; what a
+    /// helper lane computes only feeds derivatives, and its stores are
+    /// dropped.
     fn helper_reads_own(&mut self, own: V, first: V) -> V {
         if !self.s.pixel {
             return first;

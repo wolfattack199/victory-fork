@@ -349,7 +349,50 @@ fn a_constant_select_mask_on_host_halves_is_refused() {
         0x0000_0200, // ds_write_b32 v0, v2
         S_ENDPGM,
     ];
-    for words in [&inline[..], &held[..]] {
+    // A compare combined with a constant, or with a pair written apart: masks of their own
+    // (`Structured::masks`), read through `atom`. And a constant pair in `Structured::other`.
+    let with_constant = [
+        0x7D8A_0080u32, // v_cmp_ne_u32 vcc, 0, v0
+        0x8780_816A,    // s_and_b64 s[0:1], vcc, 1
+        0x7E02_02FA,
+        0xFF01_1100, // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+        0xD501_0002,
+        0x0001_0301, // v_cndmask_b32 v2, v1, 1, s[0:1]
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    let with_pair = [
+        0xBE82_03FFu32,
+        0x5555_5555, // s_mov_b32 s2, 0x55555555
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0x8780_026A, // s_and_b64 s[0:1], vcc, s[2:3]
+        0x7E02_02FA,
+        0xFF01_1100, // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+        0xD501_0002,
+        0x0001_0301, // v_cndmask_b32 v2, v1, 1, s[0:1]
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    let constant_pair = [
+        0xBE80_0481u32, // s_mov_b64 s[0:1], 1
+        0x7E02_02FA,
+        0xFF01_1100, // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+        0xD501_0002,
+        0x0001_0301, // v_cndmask_b32 v2, v1, 1, s[0:1]
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    for words in [
+        &inline[..],
+        &held[..],
+        &with_constant[..],
+        &with_pair[..],
+        &constant_pair[..],
+    ] {
         a_constant_select_mask_on_host_halves(words);
     }
 }
@@ -388,7 +431,7 @@ fn a_constant_select_mask_on_host_halves(words: &[u32]) {
     let Err(e) = lowered else {
         panic!("a constant select mask on host halves was translated");
     };
-    assert!(e.to_string().contains("a constant lane mask in a half-wave"), "{e}");
+    assert!(e.to_string().contains("lane mask in a half-wave"), "{e}");
 }
 
 #[test]
