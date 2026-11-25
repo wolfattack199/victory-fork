@@ -837,9 +837,28 @@ impl<'a> Lanes<'a> {
             }
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
-        self.active.retain(|lo| !split.contains(lo));
+        let masks: HashMap<Value, Bool> = self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect();
+        // A mask is only safe to ballot at its defining block when every lane
+        // whose bit can be set in `m` actually reaches that block (`m => cond[b]`).
+        // Masks written after EXEC was widened inside a divergent block (e.g.
+        // restoring a saved EXEC mask or a compare under widened EXEC) can hold
+        // bits for inactive lanes and must not stay in `active`.
+        self.active.retain(|lo| {
+            let Some(&m) = masks.get(lo) else {
+                return false;
+            };
+            let def_block = self
+                .defs
+                .get(lo)
+                .map(|&(b, _)| b)
+                .or_else(|| self.phis.get(lo).map(|&(b, _)| b));
+            match def_block {
+                None => true,
+                Some(block) => self.b.implies(m, cond[block]),
+            }
+        });
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            masks,
             highs: self
                 .masks
                 .keys()
@@ -1844,5 +1863,50 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn widened_exec_inside_divergent_branch_is_not_active() {
+        // Block 0 narrows EXEC with v_cmp_eq_u32 + s_and_saveexec_b32 and
+        // branches over block 1 when EXEC is zero. Inside divergent block 1
+        // (cond[1] == vcc), EXEC is widened back to the saved full mask,
+        // copied to s4, and used for a VALU compare into s6. None of those
+        // block-1 masks imply cond[1], so none may stay in `active`.
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0:  v_cmp_eq_u32 s2, 0, v0
+                0xBE80_3C02, // 8:  s_and_saveexec_b32 s0, s2
+                0xBF88_0004, // 12: s_cbranch_execz +4 (-> 32)
+                0xBEFE_0300, // 16: s_mov_b32 exec_lo, s0 (widens EXEC inside divergent block 1)
+                0xBE84_037E, // 20: s_mov_b32 s4, exec_lo
+                0xD4CA_0006,
+                0x0002_0280, // 24: v_cmp_ne_u32 s6, 0, v1 (under widened EXEC)
+                S_ENDPGM,    // 32: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+
+        let s2_val = p.blocks[0].insts[0].write(Reg::S(2)).unwrap();
+        assert!(s.masks.contains_key(&s2_val));
+        assert!(s.active.contains(&s2_val), "block-0 compare is active");
+
+        let b1 = p.blocks.iter().find(|b| b.offset == 16).expect("block 1");
+        let restored_exec = b1.insts[0].write(Reg::S(EXEC)).unwrap();
+        let copied_s4 = b1.insts[1].write(Reg::S(4)).unwrap();
+        let cmp_s6 = b1.insts[2].write(Reg::S(6)).unwrap();
+
+        for (label, val) in [
+            ("restored exec", restored_exec),
+            ("copy of widened exec", copied_s4),
+            ("v_cmp under widened exec", cmp_s6),
+        ] {
+            assert!(s.masks.contains_key(&val), "{label} tracked in masks");
+            assert!(
+                !s.active.contains(&val),
+                "{label} must not be in active (its bits include lanes not executing block 1)"
+            );
+        }
     }
 }

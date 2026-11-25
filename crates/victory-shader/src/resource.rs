@@ -1223,11 +1223,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -1865,11 +1866,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -3844,5 +3846,72 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn wide_branch_does_not_drop_predecessor_edges_in_only_edge_or_lane_phi() {
+        // Block 0 narrows EXEC on v0 == 0 and jumps over block 1 (which loads
+        // descriptor s[4:7] at offset 0x20) when EXEC == 0. At the join
+        // (block 2), EXEC is restored and then re-narrowed to v0 == 0 before
+        // reading a buffer through s[4:7].
+        // - With per-lane branching (`wide = {}`), only block 1 can reach the
+        //   v0 == 0 use, so `only_edge` proves s[4:7] comes from block 1 (0x20).
+        // - With block 0 marked wave-wide (`wide = {0}`), every lane follows
+        //   the wave's branch together so block 0's skip edge (where s[4:7] was
+        //   never loaded) is NOT ruled out by `!(v0 == 0)`: `only_edge` returns
+        //   None and tracking rejects the uninitialized skip edge.
+        let words: &[u32] = &[
+            0xBE81_0380, // 0:  s_mov_b32 s1, 0
+            0xD4C2_0002,
+            0x0002_0080, // 4:  v_cmp_eq_u32 s2, 0, v0
+            0xBE83_3C02, // 12: s_and_saveexec_b32 s3, s2
+            0xBF88_0002, // 16: s_cbranch_execz +2 (-> 28)
+            0xF408_0100,
+            0xFA00_0020, // 20: s_load_dwordx4 s[4:7], s[0:1], 0x20
+            0xBEFE_0303, // 28: s_mov_b32 exec_lo, s3
+            0xBEFE_0302, // 32: s_mov_b32 exec_lo, s2
+            0xBF88_0002, // 36: s_cbranch_execz +2 (-> 48) (so block 3 has reach == s2)
+            0xE030_0000,
+            0x8001_0000, // 40: buffer_load_dword v0, off, s[4:7], 0
+            S_ENDPGM,    // 48: s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1)];
+
+        // Per-lane branch: `only_edge` proves only the 0x20 edge reaches the read.
+        let per_lane = crate::structure::structure(&p).unwrap();
+        let r_lane = track(&p, &layout, HwStage::Cs, Some(&per_lane)).unwrap();
+        assert_eq!(r_lane.descriptors.len(), 1);
+        assert!(
+            matches!(r_lane.descriptors[0].source, Source::Loaded { .. }),
+            "per-lane branch should collapse to single loaded edge, got {:?}",
+            r_lane.descriptors[0].source
+        );
+        assert_eq!(table_offset(&r_lane, &r_lane.descriptors[0].source), 0x20);
+
+        // Wave-wide branch at block 0: must NOT prune block 0's skip edge via `only_edge`.
+        let wide = std::collections::HashSet::from([0usize]);
+        let st_wide = crate::structure::structure_wide(&p, &wide).unwrap();
+        assert!(
+            track(&p, &layout, HwStage::Cs, Some(&st_wide)).is_err(),
+            "wave-wide branch must not collapse through only_edge when skip edge is unloaded"
+        );
+
+        // Also check `lane_phi`: with `WATERFALL_JOINED_WAVE32`'s initial branch
+        // marked wave-wide, the skip edge into block 0x70 is NOT pruned as
+        // impossible, so tracing rejects the uninitialized input VGPRs on that
+        // edge instead of silently turning it into `None` (heap index 0).
+        let wf_code: Vec<u8> = WATERFALL_JOINED_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let wf_p = crate::ir::build(&wf_code, false, 256).unwrap();
+        let wf_layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let wf_wide = crate::structure::structure_wide(&wf_p, &wide).unwrap();
+        assert!(
+            track(&wf_p, &wf_layout, HwStage::Cs, Some(&wf_wide)).is_err(),
+            "wide branch must not prune the live skip edge in lane_phi"
+        );
     }
 }
