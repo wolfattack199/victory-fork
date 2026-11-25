@@ -1923,8 +1923,7 @@ impl Drop for Deferred {
 /// 3. the next submission refreshes a range of a host copy that a flight's
 ///    shaders may write, and the title wrote a page of it since it was last
 ///    copied ([`stale_under_flights`]): the refresh leaves such a range
-///    alone until the flight's writes are back, as it always did within a
-///    submission;
+///    alone until the flight's writes are back;
 /// 4. a queue stands at a wait for a memory value that no flight's
 ///    bottom-of-pipe write is known to satisfy, at an address a flight may
 ///    write ([`late_met`]);
@@ -4303,6 +4302,15 @@ impl Host {
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+        }
+        // The ranges it declared are the card's from here on: a later
+        // refresh leaves them alone until they are copied back.
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, ..) = step {
+                    shadow.writes_sent();
+                }
+            }
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may

@@ -44,6 +44,12 @@ pub(crate) struct Shadow {
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
     flights: Mutex<Flights>,
+    /// Offsets of the copy that ranges declared by the submission being
+    /// prepared hold and no earlier declared range does: none of the
+    /// shaders that write them has run, so a refresh still copies what the
+    /// title wrote there ([`Shadow::update_busy`]). Emptied when the
+    /// submission goes to the card ([`Shadow::writes_sent`]).
+    own: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, for the ranges its
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
@@ -1164,9 +1170,10 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// work of about 1 MiB for a few threads that are kept ([`wide`]). The
 /// bytes taken and the bytes compared are the same ones: a range's bytes
 /// cannot change between the moment it is declared and the end of the
-/// preparing (a declared range is left alone by every refresh, the title's
-/// own copies write title memory and not the copy, and the card runs the
-/// lists only afterwards).
+/// preparing other than by a refresh, which puts what it copies there into
+/// the snapshot too (`Shadow::update_busy`; the title's own copies write
+/// title memory and not the copy, and the card runs the lists only
+/// afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.
@@ -2074,6 +2081,25 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// `n` dwords of the copy at title address `address` (tests).
+    #[cfg(test)]
+    pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
+        let at = (address - self.start) as usize;
+        assert!(at + 4 * n <= self.len as usize);
+        // SAFETY: inside the mapping (checked); the GPU is done with it.
+        unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
+    }
+
+    /// Writes `bytes` into the copy at title address `address`, as shaders
+    /// do (tests).
+    #[cfg(test)]
+    pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        let at = (address - self.start) as usize;
+        assert!(at + bytes.len() <= self.len as usize);
+        // SAFETY: inside the mapping (checked).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+    }
+
     /// Whether the memory behind the copy turned out not to be write-watched:
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
@@ -2128,6 +2154,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
+            own: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
@@ -2152,9 +2179,11 @@ impl Shadow {
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
     /// (unordered access): after the list's submission has run, the range
-    /// is copied back into title memory, where the title reads it; until
-    /// then no refresh copies title memory over it. Call after the
-    /// [`Shadow::refresh`] that gives the shaders the title's data.
+    /// is copied back into title memory, where the title reads it. Until the
+    /// submission goes to the card a refresh still brings the title's writes
+    /// into the parts it was first to declare ([`Shadow::update_busy`]); from
+    /// then until the copy-back no refresh copies title memory over it. Call
+    /// after the [`Shadow::refresh`] that gives the shaders the title's data.
     ///
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
@@ -2195,16 +2224,9 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
-        // In the card's memory: no snapshot. What shaders wrote is found on
-        // the card (`Host::card_before` reads the declared ranges from the
-        // lists).
-        if self.card.is_some() {
-            pending.push(range);
-            return;
-        }
         // The parts no declared range holds yet: their bytes are taken now,
-        // just after the range's refresh (a part declared earlier has not
-        // been refreshed since, and keeps the bytes taken then).
+        // just after the range's refresh (a part declared earlier keeps the
+        // bytes taken then, and what a refresh copies there since).
         let mut parts = vec![self.inside(address, len)];
         for &(a, e) in pending.iter() {
             let (a, e) = self.inside(a, e - a);
@@ -2224,6 +2246,16 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.own
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(parts.iter().copied().filter(|&(from, to)| from < to));
+        // In the card's memory: no snapshot. What shaders wrote is found on
+        // the card (`Host::card_before` reads the declared ranges from the
+        // lists).
+        if self.card.is_some() {
+            return;
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -2767,30 +2799,68 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote where only this submission's shaders write
+            // (`update_busy`).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, false);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, false);
             }
-            return bytes;
+            return bytes + self.update_busy(from, to);
         }
-        self.update_free(from, to)
+        self.update_free(from, to, false)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` where ranges shaders write lie:
+    /// the parts that only ranges declared by the submission being prepared
+    /// hold (`own`). None of its shaders has run yet, so the pages the title
+    /// wrote there since they were taken are copied as anywhere else.
+    /// Skipped, the title's constants there stayed stale for the whole
+    /// submission (a dispatch read its sizes as zeros and looped until the
+    /// device was removed). The same bytes go into the snapshot, so
+    /// copy-back neither takes them for the GPU's nor puts them back over a
+    /// later title write. A part a flight in the air also holds is left
+    /// alone: its shaders may be writing it now (before the preparing the
+    /// title's bytes there are put in, or the flights settled:
+    /// `stale_under_flights` in `crate::host`).
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        let parts: Vec<(usize, usize)> = self
+            .own
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|&(a, e)| ((start + a).max(from), (start + e).min(to)))
+            .filter(|&(a, e)| a < e)
+            .collect();
+        parts
+            .into_iter()
+            .map(|(a, e)| self.update_free(a, e, true))
+            .sum()
+    }
+
+    /// The submission that declared the copy's ranges goes to the card:
+    /// from here on its shaders may be writing them, and refreshes leave
+    /// them alone until they are copied back.
+    pub(crate) fn writes_sent(&self) {
+        self.own.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    /// shader writes, or (`snapshot`) where only shaders that have not run
+    /// write: what is copied goes into the snapshot too.
+    fn update_free(&self, from: usize, to: usize, snapshot: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, snapshot);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2806,7 +2876,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy(from, to, snapshot);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2872,7 +2942,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        snapshot: bool,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -2896,23 +2973,41 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), snapshot);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy(
+                (first * PAGE).max(from),
+                ((last + 1) * PAGE).min(to),
+                snapshot,
+            );
         }
         bytes
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy,
+    /// and into the snapshot if asked and there is one.
+    fn copy(&self, from: usize, to: usize, snapshot: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if snapshot
+            && let Some(before) = self
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+        {
+            // SAFETY: the snapshot's allocation holds the copy's length
+            // (`writing`), as the mapping does.
+            unsafe {
+                std::ptr::copy_nonoverlapping(at, before.as_mut_ptr().add(from - start), to - from)
+            };
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -3686,4 +3781,83 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::{PAGE, find, register, take_snapshots, unregister};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone.
+    /// Once the submission is sent the range is left alone.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        let len = 2 * PAGE;
+        // SAFETY: a fresh write-watched allocation, kept to the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert!(p != 0 && p.is_multiple_of(PAGE));
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(p, len);
+        // An earlier list declares all of it as written by shaders.
+        copy.writing(p, len);
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert!(
+            copy.update(p + PAGE + 16, 16) > 0,
+            "the title's write is copied"
+        );
+        assert_eq!(
+            host(PAGE + 20),
+            0x55,
+            "the title's constant reaches the copy"
+        );
+        // The refreshes are done: the snapshots are taken and the lists go
+        // to the card.
+        take_snapshots();
+        copy.writes_sent();
+        // The shaders run: one byte written. The title writes meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a byte of our allocation.
+        unsafe { title(PAGE + 20).write_volatile(0x66) };
+        assert_eq!(
+            copy.update(p + PAGE + 16, 16),
+            0,
+            "sent, the range is left alone"
+        );
+        copy.copy_back(p, len);
+        copy.copy_back_done(&[(p, p + len)]);
+        // SAFETY: bytes of our allocation.
+        unsafe {
+            assert_eq!(
+                title(10).read_volatile(),
+                0xaa,
+                "the shader's write goes back"
+            );
+            assert_eq!(
+                title(PAGE + 20).read_volatile(),
+                0x66,
+                "the title's later write stays"
+            );
+        }
+        unregister(p, p as u64);
+    }
 }
