@@ -17,6 +17,35 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+/// A `UINT` or `SINT` render target format: the host does not blend into
+/// those ([`GraphicsState::host_blend`]).
+fn integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -135,6 +164,31 @@ impl GraphicsState {
 }
 
 impl GraphicsState {
+    /// The blend state the host can make for these render targets. D3D12
+    /// refuses a pipeline that blends into a target of an integer format
+    /// (`UINT` or `SINT`): the title does, and the console's GPU lets it
+    /// (the blend is a no-op there). Blending is switched off for those
+    /// targets and kept for the others; with no integer target the state is
+    /// returned as it is.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| integer_format(self.targets.RTFormats[i]);
+        if !(0..n).any(integer) {
+            return blend;
+        }
+        // Without independent blending, target 0's state stands for all.
+        if !blend.IndependentBlendEnable.as_bool() {
+            let first = blend.RenderTarget[0];
+            blend.RenderTarget = [first; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..n).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -1131,6 +1185,88 @@ mod tests {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
     }";
+
+    #[test]
+    fn blending_into_integer_targets_is_switched_off_and_kept_elsewhere() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R32_UINT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R16_SINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        // Not independent: target 0's state stands for all three.
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool(), "the unorm target keeps it");
+        assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA, "the rest of the state is copied");
+
+        // Independent: each target's own state, only the integer ones cleared.
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[1].BlendEnable = true.into();
+        g.blend.RenderTarget[2].BlendEnable = false.into();
+        let b = g.host_blend();
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+
+        // No integer target among those in use (target 3 is past the count):
+        // the state is returned as it is.
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[3] = DXGI_FORMAT_R32_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// The host refuses a pipeline that blends into an integer target; with
+    /// the blending switched off (`host_blend`) it makes it.
+    #[test]
+    fn a_pipeline_blending_into_an_integer_target_is_made_without_the_blending() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
+        let ps = compile(&dxc, dir.path(), "uint main() : SV_Target { return 1; }", "ps_6_5");
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        let make = |blend: D3D12_BLEND_DESC| {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed pointer, never released by the descriptor.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: code(&vs),
+                PS: code(&ps),
+                BlendState: blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: g.targets.RTFormats,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            // SAFETY: a plain creation call on the host device.
+            unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) }
+        };
+        assert!(make(g.blend).is_err(), "this host makes a pipeline that blends into R32_UINT");
+        assert!(make(g.host_blend()).is_ok(), "the host makes it without the blending");
+    }
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
     /// pipeline library and culls or passes fragments according to
