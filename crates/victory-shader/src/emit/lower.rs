@@ -9141,13 +9141,49 @@ impl<'a> Lower<'a> {
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
-        self.x.io.interps.iter().any(|(_, i)| match *i {
+        self.mixed_row(row) || self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
             Interp::Vertex { attribute, vertex } => {
                 attribute.row == row && vertex != 2 && self.interpolated(row)
             }
             Interp::Interpolated { .. } => false,
         })
+    }
+
+    /// Whether register row `row` is read in ways one DXIL interpolation
+    /// mode cannot serve: two modes, or an interpolation beside a flat read
+    /// or an integer element. DXIL gives the elements packed into a row one
+    /// mode (the validator: "interpolation mode that differs from another
+    /// element packed into the same row"); the console packs by register
+    /// alone, its code doing the interpolation. Such a row is declared
+    /// constant and its interpolations weigh the vertices with
+    /// `SV_Barycentrics`, as rows read per vertex already are
+    /// (`shader::harmonize_input_rows` aligns the elements nothing reads).
+    /// `VICTORY_FIX_MIXED=0` turns it off, for comparisons.
+    fn mixed_row(&self, row: u8) -> bool {
+        if std::env::var_os("VICTORY_FIX_MIXED").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let mut modes: Vec<u8> = Vec::new();
+        for (_, i) in &self.x.io.interps {
+            let m = match *i {
+                Interp::Interpolated { attribute, barycentric, .. } if attribute.row == row => {
+                    interp_mode(barycentric).unwrap_or(0)
+                }
+                Interp::Vertex { attribute, vertex: 2 } if attribute.row == row => 1,
+                _ => continue,
+            };
+            if !modes.contains(&m) {
+                modes.push(m);
+            }
+        }
+        let interpolates = modes.iter().any(|&m| m != 1);
+        let ints = self
+            .s
+            .inputs
+            .iter()
+            .any(|e| e.kind == 0 && e.row == Some(u32::from(row)) && e.comp != 9);
+        interpolates && (modes.len() > 1 || ints)
     }
 
     /// Whether the program interpolates attribute row `row` (so the

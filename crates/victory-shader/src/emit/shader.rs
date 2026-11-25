@@ -445,6 +445,9 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel && std::env::var_os("VICTORY_FIX_HARMONIZE").is_none_or(|v| v != "0") {
+            harmonize_input_rows(&mut self.inputs);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -886,5 +889,86 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Pixel inputs sharing a register row get one interpolation mode, as DXIL
+/// wants ("interpolation mode that differs from another element packed
+/// into the same row"). The console's compiler packs elements by register
+/// alone, since its shader code does the interpolation; here an element no
+/// code reads kept its default mode beside one read another way. Such an
+/// element takes the mode of the row's read elements (or, in a row nothing
+/// reads, constant when the row holds an integer). Rows whose reads
+/// themselves differ are made constant and interpolated by hand when
+/// lowered (`Lower::mixed_row`). `VICTORY_FIX_HARMONIZE=0` turns it off.
+pub(crate) fn harmonize_input_rows(inputs: &mut [SigElement]) {
+    let rows: std::collections::BTreeSet<u32> =
+        inputs.iter().filter(|e| e.kind == 0).filter_map(|e| e.row).collect();
+    for r in rows {
+        let of = |e: &SigElement| e.kind == 0 && e.row == Some(r);
+        let mut read: Vec<u8> = inputs.iter().filter(|e| of(e) && e.usage != 0).map(|e| e.interp).collect();
+        read.sort_unstable();
+        read.dedup();
+        let mode = match read[..] {
+            [m] => m,
+            [] if inputs.iter().any(|e| of(e) && e.comp != 9) => 1,
+            _ => continue,
+        };
+        for e in inputs.iter_mut().filter(|e| of(e) && e.usage == 0) {
+            // An integer is never interpolated.
+            if e.comp == 9 || mode == 1 {
+                e.interp = mode;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::harmonize_input_rows;
+    use super::SigElement;
+
+    fn element(index: u32, row: u32, col: u8, comp: u8, interp: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn an_unread_element_takes_the_mode_of_the_read_one() {
+        // Row 3: a linear float read (2) beside an unread float left at constant (1).
+        let mut e = vec![element(0, 3, 0, 9, 2, 1), element(1, 3, 1, 9, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[1].interp, 2);
+    }
+
+    #[test]
+    fn an_unread_integer_is_never_made_interpolated() {
+        let mut e = vec![element(0, 3, 0, 9, 2, 1), element(1, 3, 1, 5, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[1].interp, 1);
+    }
+
+    #[test]
+    fn a_row_nothing_reads_is_constant_when_it_holds_an_integer() {
+        let mut e = vec![element(0, 4, 0, 9, 2, 0), element(1, 4, 1, 5, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!((e[0].interp, e[1].interp), (1, 1));
+    }
+
+    #[test]
+    fn rows_read_two_ways_are_left_to_the_lowering() {
+        let mut e = vec![element(0, 5, 0, 9, 2, 1), element(1, 5, 1, 9, 1, 1), element(2, 5, 2, 9, 4, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[2].interp, 4);
     }
 }
