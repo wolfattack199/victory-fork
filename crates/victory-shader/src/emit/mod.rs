@@ -92,6 +92,8 @@ mod lower;
 mod own_bits;
 mod rect;
 mod sampler;
+#[cfg(all(test, windows))]
+mod image_lod_tests;
 mod shader;
 mod threading;
 #[cfg(windows)]
