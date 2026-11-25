@@ -21,11 +21,48 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
 | Checks | 537 tests pass, 0 fail, 10 are ignored; three lints that failed the strict check are fixed |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
-| Graphics in the game | **not measured on this PC yet** |
-| Frame rate in the world | **not measured on this PC yet** |
+| Graphics in the game | the opening cutscene draws: characters, cars, streets, lights and title cards. Shadowed areas, faces among them, are too dark or black in some shots, and some objects appear late |
+| Frame rate in the world | **not playable: 1.5 to 4 fps in most of the opening cutscene**, 6 to 7 fps at best, single frames of 1 to 4 seconds |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
+
+### Progress report, 2026-11-25
+
+Measured on one PC: Windows 11, Ryzen 5 5500 (6 cores), RTX 5060 Ti 16 GB,
+32 GB RAM, in the opening cutscene, with the Series X and Series S profiles.
+**The code for what follows is still being tested and is not on `main` yet**;
+it comes here when its tests have passed.
+
+| What | Before | Now |
+|---|---|---|
+| Picture in cutscenes | black, with sound (only the first of the planes the title presents was shown) | drawn |
+| World frames | 2 to 5 s each; texture refreshes waited up to 4.1 of 4.2 s for title memory to hold still | 0.25 to 0.7 s in most shots, 0.14 s at best |
+| Making a texture on the card | 0.5 to 1.2 ms each | about 0.05 ms (placed in shared blocks of card memory) |
+| Upload buffer for a texture | 1.4 ms each | about 0.2 ms (used again) |
+| Upscaler shaders | several did not translate | translate |
+| Input | controller only | keyboard and mouse too, with a key file |
+| Intro and loading screens | 30 fps | 30 fps, with dips while the world loads (not a milestone) |
+
+What holds the frame rate down now, as measured:
+
+- The processor is at 100 %. NVIDIA's driver compiles shaders again in the
+  background on four threads, about 3.5 of the 6 cores for minutes; the same
+  scene went from 1-2 fps to 6.9 fps when that stopped by itself. Windows only
+  lets a program switch it off in Developer Mode, so those threads are being
+  kept on one core instead.
+- Memory: the game takes 20 to 27 GB on top of everything else that runs, the
+  system is at its commit limit, and the page file grows by 14 to 35 GB.
+- Card memory is full (16 GB in use), and copies between title memory and the
+  card take 60 to 230 ms a frame each way. The card itself is busy for 20 to
+  200 ms of a frame.
+
+Known problems: sound cuts out while the processor is saturated; three puddle
+pixel shaders and several compute programs do not translate or are refused;
+ray tracing is off, so nothing is lit by it.
+
+No footage is published here: this repository holds nothing from the game
+([docs/asset-policy.md](docs/asset-policy.md)).
 
 ## Credits
 
