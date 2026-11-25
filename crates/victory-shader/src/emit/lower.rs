@@ -65,6 +65,18 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Number of critical-edge blocks recorded in `Lower::edges`.
+    #[cfg(test)]
+    pub edge_blocks: usize,
+    /// Number of mesh blocks with barriers suppressed (`Lower::no_barrier`).
+    #[cfg(test)]
+    pub no_barrier_blocks: usize,
+    /// Number of `waveReadLaneFirst.i32` ops emitted by `scalar_dynamic`.
+    #[cfg(test)]
+    pub scalar_wave_first: usize,
+    /// Number of raw UAV loads emitted by `smem`.
+    #[cfg(test)]
+    pub smem_raw_uavs: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -210,8 +222,13 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
-    /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    /// Blocks splitting the edge from one IR block to another (flag distinguishes
+    /// the second edge when a conditional branch targets the same block twice).
+    edges: HashMap<(usize, usize, bool), usize>,
+    #[cfg(test)]
+    scalar_wave_first: usize,
+    #[cfg(test)]
+    smem_raw_uavs: usize,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -1438,12 +1455,18 @@ impl<'a> Lower<'a> {
                 index[b] = n;
             }
             let idom = crate::ir::idoms(&p.blocks, &order, &index);
+            let all = all_lane_blocks(x.st);
             let alloc: Vec<usize> = (0..p.blocks.len())
                 .filter(|&b| {
-                    p.blocks[b].insts.iter().any(|i| {
-                        i.name() == "s_sendmsg"
-                            && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
-                    })
+                    // Only a divergent `GS_ALLOC_REQ` (one lane requesting) makes
+                    // dominated barriers unsafe; an all-lane `GS_ALLOC_REQ` in
+                    // block 0 or another uniform block must not strip every
+                    // `s_barrier` across the mesh shader.
+                    all.as_ref().is_none_or(|a| !a[b])
+                        && p.blocks[b].insts.iter().any(|i| {
+                            i.name() == "s_sendmsg"
+                                && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+                        })
                 })
                 .collect();
             for &b in &order {
@@ -1511,6 +1534,10 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
+            #[cfg(test)]
+            scalar_wave_first: 0,
+            #[cfg(test)]
+            smem_raw_uavs: 0,
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -2211,6 +2238,14 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            edge_blocks: self.edges.len(),
+            #[cfg(test)]
+            no_barrier_blocks: self.no_barrier.len(),
+            #[cfg(test)]
+            scalar_wave_first: self.scalar_wave_first,
+            #[cfg(test)]
+            smem_raw_uavs: self.smem_raw_uavs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5487,8 +5522,13 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            let uav = matches!(kind, Some(u) if u.kind == ResourceType::Uav);
+            #[cfg(test)]
+            if uav {
+                self.smem_raw_uavs += 1;
+            }
+            let h = self.handle(site, src, false, (if uav { 0x100b } else { 11 }, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -5716,8 +5756,10 @@ impl<'a> Lower<'a> {
                 (props, None)
             }
             // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
+            Fields::Smem { .. }
+                if used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) =>
+            {
+                ((11 | u, 0), None)
             }
             // A constant buffer: nothing of its descriptor is a number.
             Fields::Smem { .. } => {
@@ -5837,18 +5879,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(value) = a.dynamic {
-            let mut d = self.i32_of(value)?;
-            // A term held per lane reached the address through
-            // `v_readfirstlane_b32`: the first lane's.
-            let per_lane = self.def_block.get(&value).is_some_and(|&b| {
-                let writes = |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
-                self.x.p.blocks[b].insts.iter().any(writes)
-            });
-            if per_lane {
-                self.s.flags |= flags::WAVE_OPS;
-                let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
-            }
+            let d = self.scalar_dynamic(value)?;
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -6008,13 +6039,54 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// Whether `value` is defined as a VGPR (program input, phi, or instruction
+    /// write), meaning it reached a scalar address via `v_readfirstlane_b32`.
+    fn is_vgpr_value(&self, value: Value) -> bool {
+        if self
+            .x
+            .p
+            .inputs
+            .iter()
+            .any(|&(r, v)| v == value && matches!(r, Reg::V(_)))
+        {
+            return true;
+        }
+        if let Some(&(b, i)) = self.phi_at.get(&value) {
+            return matches!(self.x.p.blocks[b].phis[i].reg, Reg::V(_));
+        }
+        self.def_block.get(&value).is_some_and(|&b| {
+            let writes =
+                |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
+            self.x.p.blocks[b].insts.iter().any(writes)
+        })
+    }
+
+    /// Lowers a dynamic byte offset of a scalar address (`code_smem` or
+    /// `Source::Built`), restoring `waveReadLaneFirst.i32` whenever `resource`
+    /// unwrapped a `v_readfirstlane_b32` back to a VGPR value.
+    fn scalar_dynamic(&mut self, value: Value) -> Result<V, Why> {
+        let mut d = self.i32_of(value)?;
+        if self.is_vgpr_value(value) {
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            {
+                self.scalar_wave_first += 1;
+            }
+            let i32t = self.s.t.i32;
+            d = self
+                .s
+                .op(self.cur, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+        }
+        Ok(d)
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
                 let mut x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
+                    Some(v) => Some(self.scalar_dynamic(v)?),
                     None => None,
                 };
                 if let Some(bias) = self.root_bias(address.param) {
@@ -6272,12 +6344,13 @@ impl<'a> Lower<'a> {
         const WHY: Why = "a descriptor chosen by control flow";
         let p = self.x.p;
         let mut incoming = Vec::new();
-        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+        for (n, (&q, arg)) in p.blocks[block].preds.iter().zip(args).enumerate() {
             if self.block[q].is_none() {
                 continue;
             }
             let tail = self.tail[q].ok_or(WHY)?;
-            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let second = p.blocks[block].preds[..n].contains(&q);
+            let at = self.edges.get(&(q, block, second)).copied().unwrap_or(tail);
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
@@ -6383,13 +6456,14 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                for (n, (&q, arg)) in self.x.p.blocks[*block].preds.iter().zip(args).enumerate() {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let second = self.x.p.blocks[*block].preds[..n].contains(&q);
+                    let at = self.edges.get(&(q, *block, second)).copied().unwrap_or(tail);
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -10963,7 +11037,8 @@ impl<'a> Lower<'a> {
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let t = self.edge(b, taken, false);
+                let f = self.edge(b, not_taken, taken == not_taken);
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
@@ -11057,7 +11132,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
-    fn edge(&mut self, from: usize, to: usize) -> usize {
+    /// `second` distinguishes the second edge when a conditional branch
+    /// targets the same block on both arms.
+    fn edge(&mut self, from: usize, to: usize, second: bool) -> usize {
         let target = self.block[to].expect("reachable");
         let preds = self.x.p.blocks[to]
             .preds
@@ -11070,7 +11147,7 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.m.new_block();
         self.s.m.terminate(e, Term::Br(target));
-        self.edges.insert((from, to), e);
+        self.edges.insert((from, to, second), e);
         e
     }
 
@@ -11090,7 +11167,8 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let second = p.blocks[b].preds[..n].contains(&q);
+                let qb = self.edges.get(&(q, b, second)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -11139,7 +11217,8 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let second = p.blocks[b].preds[..n].contains(&q);
+                let qb = self.edges.get(&(q, b, second)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
@@ -11838,5 +11917,232 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn all_lane_mesh_gs_alloc_req_preserves_lds_barrier() {
+        let lower_mesh = |words: &[u32]| -> Lowered {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: false,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 3,
+                    max_primitives: 1,
+                    topology: 2,
+                    lds_bytes: 256,
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap()
+        };
+
+        // All-lane GS_ALLOC_REQ in entry block 0: no block is added to no_barrier.
+        let all_lane = lower_mesh(&[
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0009, // s_sendmsg GS_ALLOC_REQ (id = 9)
+            0xBF8A_0000, // s_barrier
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            all_lane.no_barrier_blocks, 0,
+            "all-lane GS_ALLOC_REQ must not strip mesh LDS barriers"
+        );
+
+        // Divergent (single-lane) GS_ALLOC_REQ inside a per-lane branch: its
+        // block (and anything it dominates) MUST still be in no_barrier.
+        let divergent = lower_mesh(&[
+            0xD4C2_0002,
+            0x0002_0080, // v_cmp_eq_u32 s2, 0, v0
+            0xBE83_3C02, // s_and_saveexec_b32 s3, s2
+            0xBF88_0003, // s_cbranch_execz +3 (-> s_endpgm)
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0009, // s_sendmsg GS_ALLOC_REQ
+            0xBF8A_0000, // s_barrier (single-lane, dominated by divergent alloc)
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            divergent.no_barrier_blocks, 1,
+            "divergent single-lane GS_ALLOC_REQ must still suppress dominated barriers"
+        );
+    }
+
+    #[test]
+    fn smem_uav_uses_raw_buffer_load_not_cbuffer() {
+        // Root UAV at s[0:1] built into buffer descriptor s[4:7], read by
+        // s_buffer_load_dword (sbase = 4/2 = 2) and stored to LDS.
+        let root_words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0301, // s_mov_b32 s5, s1
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF420_0202,
+            0xFA00_0000, // s_buffer_load_dword s8, s[4:7], 0x0
+            0x7E02_0208, // v_mov_b32 v1, s8
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let root_layout = vec![root(RootType::Descriptor, 0, 0)];
+        let root_used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }];
+        let root_out = lower_with(&root_words, root_layout, root_used)
+            .expect("root UAV read via s_buffer_load_dword must lower as raw UAV load");
+        assert_eq!(root_out.root_uavs, [0]);
+        assert!(root_out.root_cbvs.is_empty());
+        assert_eq!(root_out.smem_raw_uavs, 1);
+
+        // Table UAV at s0 loaded via s_load_dwordx4 into s[8:11], read via
+        // s_buffer_load_dword (sbase = 8/2 = 4), and also queried for its
+        // size dword (s10, exercising `descriptor_data` for a UAV read only by SMEM).
+        let table_words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+            0x800D_0A0C, // s_add_u32 s13, s12, s10 (reads UAV descriptor dword 2 as data)
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let table_layout = vec![root(RootType::Table, 0, 0)];
+        let table_used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let table_out = lower_with(&table_words, table_layout, table_used)
+            .expect("table UAV read via s_buffer_load_dword must lower as raw UAV load");
+        assert_eq!(table_out.smem_raw_uavs, 1);
+    }
+
+    #[test]
+    fn same_target_conditional_branch_keeps_both_edge_blocks() {
+        // Block 0 branches on s0 to block 2 (offset 20) or falls through to
+        // block 1. Block 1 sets s2 = 1 and executes a conditional branch whose
+        // taken and not-taken targets are BOTH block 2 (offset 20). Block 2
+        // joins s2 with a PHI and writes it to LDS. Both same-target edges
+        // from block 1 to block 2 must retain distinct entries in `edges`.
+        let words = [
+            0xBE82_0380, // 0:  s_mov_b32 s2, 0
+            0xBF06_8000, // 4:  s_cmp_eq_u32 s0, 0
+            0xBF85_0003, // 8:  s_cbranch_scc1 +3 (-> 24)
+            0xBE82_0381, // 12: s_mov_b32 s2, 1
+            0xBF06_8001, // 16: s_cmp_eq_u32 s1, 0
+            0xBF85_0000, // 20: s_cbranch_scc1 +0 (taken == not_taken == 24)
+            0x7E02_0202, // 24: v_mov_b32 v1, s2
+            0xD834_0000,
+            0x0000_0100, // 28: ds_write_b32 v0, v1
+            S_ENDPGM,    // 36: s_endpgm
+        ];
+        let layout = vec![
+            root(RootType::Constants, 0, 0),
+            root(RootType::Constants, 1, 1),
+        ];
+        let out = lower_with(&words, layout, vec![]).unwrap();
+        // Block 0 -> block 2 (1 edge) + block 1 -> block 2 (2 distinct edges) = 3 edge blocks.
+        // Previously the second edge from block 1 overwrote the first (leaving only 2).
+        assert_eq!(out.edge_blocks, 3);
+    }
+
+    #[test]
+    fn scalar_dynamic_offset_wraps_vgpr_input_and_phi_in_wave_read_lane_first() {
+        // 1. Source::Built (root SRV descriptor) with dynamic byte offset taken
+        //    from input VGPR v0 via v_readfirstlane_b32: built_offset must emit
+        //    waveReadLaneFirst.i32 and set WAVE_OPS.
+        let built_words = [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0 (program input VGPR!)
+            0x8004_0400, // s_add_u32 s4, s0, s4
+            0x8205_8001, // s_addc_u32 s5, s1, 0
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xE030_0000,
+            0x8001_0100, // buffer_load_dword v1, off, s[4:7], 0
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Descriptor, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }];
+        let built_out = lower_with(&built_words, layout, used).unwrap();
+        assert!(built_out.wave_ops);
+        assert_eq!(
+            built_out.scalar_wave_first, 1,
+            "built_offset must emit waveReadLaneFirst.i32 for input-VGPR dynamic offset"
+        );
+
+        // 2. code_smem (s_load_dword from PC-relative code table) with dynamic
+        //    offset from a VGPR phi (v2 joined across a scalar branch) via
+        //    v_readfirstlane_b32.
+        let code_words = [
+            0x7E04_0280, // 0:  v_mov_b32 v2, 0
+            0xBF06_8000, // 4:  s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // 8:  s_cbranch_scc1 +1 (-> 16)
+            0x7E04_0300, // 12: v_mov_b32 v2, v0
+            0xBE84_1F00, // 16: s_getpc_b64 s[4:5] (PC = 20)
+            0x7E0C_0502, // 20: v_readfirstlane_b32 s6, v2 (VGPR phi!)
+            0x8004_0604, // 24: s_add_u32 s4, s4, s6
+            0x8205_8005, // 28: s_addc_u32 s5, s5, 0
+            0xF400_0202,
+            0xFA00_0020, // 32: s_load_dword s8, s[4:5], 0x20 (code table at offset 52)
+            0x7E02_0208, // 40: v_mov_b32 v1, s8
+            0xD834_0000,
+            0x0000_0100, // 44: ds_write_b32 v0, v1
+            S_ENDPGM,    // 52: s_endpgm
+            0x1234_5678, // 56: constant table entry
+        ];
+        let code_out =
+            lower_with(&code_words, vec![root(RootType::Constants, 0, 0)], vec![]).unwrap();
+        assert!(code_out.wave_ops);
+        assert_eq!(
+            code_out.scalar_wave_first, 1,
+            "code_smem must emit waveReadLaneFirst.i32 for VGPR-phi dynamic offset"
+        );
     }
 }
