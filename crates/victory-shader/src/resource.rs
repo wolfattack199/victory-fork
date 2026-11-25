@@ -1168,7 +1168,7 @@ impl<'a> Tracer<'a> {
         {
             return Ok(Source::Constant(consts));
         }
-        if let Some(source) = self.loaded(words) {
+        if let Some(source) = self.loaded(words).or_else(|| self.loaded_raw(words)) {
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -2069,6 +2069,38 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// A loaded buffer descriptor the code made raw, whatever its element
+    /// was: stride 0, as many records as it has bytes, bounds checked by the
+    /// byte. The same bytes, which is all that the byte offsets such a
+    /// descriptor is read with ask of it.
+    fn loaded_raw(&self, words: &[Term]) -> Option<Source> {
+        let &[w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = words else {
+            return None;
+        };
+        let constant = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let stride = |v: Term, d1: Term| {
+            let Term::Value(v) = v else { return false };
+            let Some(Term::Value(field)) = constant(v, "s_max_u32", 1) else {
+                return false;
+            };
+            // 14 bits from bit 16.
+            matches!(self.sop2(field, &["s_bfe_u32"]), Some((_, [x, Term::Const(0x000E_0010)])) if x == d1)
+        };
+        let d1 = constant(w1, "s_and_b32", 0xC000_FFFF)?;
+        let d2 = match self.sop2(w2, &["s_mul_i32"])?.1 {
+            [x, n] | [n, x] if stride(n, d1) => x,
+            _ => return None,
+        };
+        let Term::Value(masked) = constant(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = constant(masked, "s_and_b32", 0xCFFF_FFFF)?;
+        self.loaded(&[w0, d1, d2, d3])
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -2333,6 +2365,14 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" {
+        // `width` ones from bit `at` up.
+        let (Operand::Const(width), Operand::Const(at)) = (*src.first()?, *src.get(1)?) else {
+            return None;
+        };
+        let (width, at) = (inline(width)? & 31, inline(at)? & 31);
+        return Some(Moved::Const(((1 << width) - 1) << at));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2345,6 +2385,8 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // A literal is the low half.
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;

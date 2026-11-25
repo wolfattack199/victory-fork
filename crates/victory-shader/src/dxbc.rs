@@ -26,6 +26,8 @@ impl FourCC {
     pub const PSG1: FourCC = FourCC(*b"PSG1");
     pub const SFI0: FourCC = FourCC(*b"SFI0");
     pub const HASH: FourCC = FourCC(*b"HASH");
+    /// Native code alone (`native::packaged`), in place of a `DXIL` part.
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
 }
@@ -108,6 +110,12 @@ impl<'a> Container<'a> {
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
+    }
+
+    /// The data of the part that holds the native programs, if one does
+    /// (`native::container_programs`).
+    pub fn native_part(&self) -> Option<&'a [u8]> {
+        self.part(FourCC::DXIL).or_else(|| self.part(FourCC::ACCC)).map(|p| p.data)
     }
 }
 

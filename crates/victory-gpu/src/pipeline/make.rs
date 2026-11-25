@@ -107,6 +107,56 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// Waiting allowed per title frame in the world ([`in_world`]), where half a
+/// second in each frame that meets a new pipeline is most of the frame:
+/// `VICTORY_PIPELINE_WAIT_WORLD_MS`, as everywhere else when it is not set.
+fn world_wait_budget() -> Duration {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| {
+            let ms = std::env::var("VICTORY_PIPELINE_WAIT_WORLD_MS").ok()?.trim().parse().ok()?;
+            Some(Duration::from_millis(ms))
+        })
+        .map_or_else(wait_budget, |world| world.min(wait_budget()))
+}
+
+/// Draws the title recorded for the frame it last presented.
+static LAST_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// At every present: the draws recorded since the start.
+pub(crate) fn note_frame(drawn: u64) {
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let before = DRAWN.swap(drawn, Ordering::Relaxed);
+    LAST_DRAWS.store(drawn.saturating_sub(before), Ordering::Relaxed);
+}
+
+/// Whether the title draws its world: a loading screen has about ten draws,
+/// a menu a few dozen.
+fn in_world() -> bool {
+    LAST_DRAWS.load(Ordering::Relaxed) > 100
+}
+
+/// The most workers that make pipelines at once while the title draws its
+/// world (`VICTORY_PIPELINE_WORKERS_WORLD`; all of them when it is not set).
+/// Each one takes a processor from the title's frame, its audio included.
+fn world_workers() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WORKERS_WORLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(u64::MAX, |n| n.max(1))
+    })
+}
+
+/// Whether one more worker may make a pipeline while `making` do.
+fn may_make(making: u64, world: bool, limit: u64) -> bool {
+    !world || making < limit
+}
+
+/// Workers making a pipeline now.
+static MAKING_NOW: AtomicU64 = AtomicU64::new(0);
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -161,7 +211,7 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let budget = if in_world() { world_wait_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
     }
@@ -285,10 +335,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
 fn next() -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        let may = may_make(MAKING_NOW.load(Ordering::Relaxed), in_world(), world_workers());
+        if may && let Some(p) = queue.pop() {
+            MAKING_NOW.fetch_add(1, Ordering::Relaxed);
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = if may {
+            AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner())
+        } else {
+            // Looked at again when a loading screen may have begun.
+            let wait = Duration::from_millis(100);
+            AVAILABLE.wait_timeout(queue, wait).unwrap_or_else(|e| e.into_inner()).0
+        };
     }
 }
 
@@ -336,12 +394,18 @@ fn commit_room() {
 /// Times a pipeline worker waited for commit ([`commit_room`]).
 pub(crate) static COMMIT_WAITS: AtomicU64 = AtomicU64::new(0);
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers on first use: half the logical processors, 2 to 8, or
+/// `VICTORY_PIPELINE_WORKERS` (1 to 32). More of them get through a long list
+/// sooner, at the menu say, and take more of the processor and of memory.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let half = || std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or_else(half, |n| n.clamp(1, 32));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -356,6 +420,8 @@ fn workers() -> bool {
                         let p = next();
                         commit_room();
                         p.make();
+                        MAKING_NOW.fetch_sub(1, Ordering::Relaxed);
+                        AVAILABLE.notify_one();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {

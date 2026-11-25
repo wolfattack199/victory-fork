@@ -226,6 +226,21 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Keyboard and mouse instead of controllers: set `VICTORY_KBM=1`. Pads, real and
+virtual, are then left out, and the mouse turns the right stick. The title
+itself has no mouse pointer, so its menus cannot be clicked: there the wheel
+moves, the left button selects and the right one goes back.
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_KBM=1` | keyboard and mouse instead of controllers |
+| `VICTORY_KEYBINDS=<file>` | bindings, one `key = action` per line under `[foot]`, `[drive]` and `[menu]`; saved changes take effect while the title runs. The bindings without a file are `DEFAULT` in `gameinput/kbm.rs` |
+| `VICTORY_MOUSE=<n>` | mouse speed (1 unless set) |
+
+It starts with the menu bindings. F10 switches between menu and play bindings,
+Esc opens the menu and switches too, Caps Lock switches between foot and
+drive, F9 lets go of the mouse.
+
 ## Commands
 
 ```

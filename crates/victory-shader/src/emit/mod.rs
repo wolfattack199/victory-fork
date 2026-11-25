@@ -303,10 +303,10 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    if c.native_part().is_none() {
+        return Err(ShaderError::Malformed("no DXIL part"));
+    }
+    let native = crate::container_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -328,8 +328,37 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran. One refused because not
+/// every lane of the console wave is known to take part
+/// (`lower::needs_every_lane`) is emitted again with its masks taken at their
+/// word ([`structure::trusting_active`]), as all were before that was checked:
+/// of 225 compute programs a 32-lane host refused in one run, none translates
+/// without this and 224 did before the check. `VICTORY_MASK_TRUST=0` leaves
+/// them refused.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_forms(c, native, p, st, io, res);
+    let lanes = matches!(&first, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what));
+    if !lanes || std::env::var_os("VICTORY_MASK_TRUST").is_some_and(|v| v == "0") {
+        return first;
+    }
+    let again = structure::trusting_active(|| {
+        let st = structure::structure(p).ok()?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+        let io = io::raise(p, native).ok()?;
+        emit_forms(c, native, p, &st, &io, &res).ok()
+    });
+    again.map_or(first, Ok)
+}
+
+/// [`emit`], with the program's masks as they are.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

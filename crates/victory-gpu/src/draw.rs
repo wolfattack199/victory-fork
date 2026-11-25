@@ -362,6 +362,24 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Since the last frame-rate line, the parts of the pass over the textures
+/// picked by index ([`State::heap_textures`]), in microseconds: which slots
+/// are due; the looks at textures uploaded already; asking how much of a
+/// texture is mapped; making the view and its texture; bringing it up to
+/// date; asking whether all of it was there; its print; and all of it.
+pub(crate) static HEAP_TEXTURE_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// And how many slots each of those was done for.
+pub(crate) static HEAP_TEXTURE_PART_COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// `f`'s result, its time added to [`HEAP_TEXTURE_PARTS`]' place `part`.
+fn part_of_pass<T>(part: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    HEAP_TEXTURE_PARTS[part].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    HEAP_TEXTURE_PART_COUNTS[part].fetch_add(1, Ordering::Relaxed);
+    out
+}
+
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
@@ -1495,7 +1513,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
-        self.heap_textures(list, heap, host);
+        part_of_pass(7, || self.heap_textures(list, heap, host));
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1713,16 +1731,18 @@ impl State {
         }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
-        // Levels on demand: the slots of textures whose first level with
-        // memory changed since the last pass are made again from it.
-        host.texture_views_remade();
-        // And with room, the textures whose upload left a held level
-        // without the card's memory are uploaded again.
-        if room {
-            host.texture_slots_waiting(frame);
-        }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = part_of_pass(0, || {
+            host.texture_slots_remapped(frame);
+            // Levels on demand: the slots of textures whose first level with
+            // memory changed since the last pass are made again from it.
+            host.texture_views_remade();
+            // And with room, the textures whose upload left a held level
+            // without the card's memory are uploaded again.
+            if room {
+                host.texture_slots_waiting(frame);
+            }
+            host.texture_slots_due(frame, 4096)
+        });
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1800,7 +1820,7 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if part_of_pass(1, || crate::texture::fingerprint(at, len)) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -1827,7 +1847,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = part_of_pass(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1898,7 +1918,7 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = part_of_pass(3, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1918,7 +1938,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                part_of_pass(4, || readable(list, sampled.kind, view));
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1931,7 +1951,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) = part_of_pass(5, || crate::texture::staged(resource)).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
@@ -1969,7 +1989,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = part_of_pass(6, || crate::texture::fingerprint(at, len));
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

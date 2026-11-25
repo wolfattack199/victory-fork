@@ -310,11 +310,19 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_held(start, end, guarded).map(|(now, pages, _)| (now, pages))
+}
+
+/// [`writes`], and whether every block of the range is guarded and clean
+/// from here on: until its count changes ([`changes`]) nothing is written.
+pub(crate) fn writes_held(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let waiting = std::time::Instant::now();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    count_us(8, waiting);
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -323,37 +331,40 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
+            false,
         ));
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
+    let mut found = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(found.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
+    // SAFETY: the answer buffer holds `found` entries.
     let failed = unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
             (last - first) * PAGE,
             j.found.as_mut_ptr().cast(),
-            &mut count,
+            &mut found,
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
+    count(6, 1);
+    count_us(7, started);
+    let (guarded, held) = if failed {
+        found = 0;
         if !guarded {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard_held(first * PAGE, last * PAGE);
+        count(0, 1);
+        count_us(1, guarding);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     #[cfg(feature = "diagnostics")]
     {
@@ -364,7 +375,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let pages = j.found[..found].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -374,11 +385,60 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
+        held,
     ))
 }
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+
+/// For the log, since the last line: askings of the guards and their
+/// microseconds, blocks made read-only and the calls that did it, faults
+/// taken, blocks opened, askings of the kernel and their microseconds, and
+/// the microseconds waited for the journal.
+/// Last: refreshes answered without an asking ([`changes`]).
+pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// A refresh that asked nobody ([`changes`]).
+pub(crate) fn quiet() {
+    count(9, 1);
+}
+
+/// How often each guarded block stopped being as its copies took it
+/// (written, opened, mapped anew): by block number, the low bits. Two blocks
+/// may share a count: one is then asked about for the other.
+///
+/// Who found a block clean ([`writes_held`]) and finds its count unchanged
+/// knows without a lock that nothing happened to it: a block leaves the
+/// clean ones only where its count goes up. 1,800 askings a frame were
+/// answered under two locks, with 115 to 175 ms a frame waiting for one
+/// another, and nearly all of them "nothing".
+static CHANGES: [std::sync::atomic::AtomicU32; 1 << 18] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 18];
+
+fn change(block: usize) {
+    CHANGES[block & (CHANGES.len() - 1)].fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The count of the block that is page `page` ([`CHANGES`]). Taken before an
+/// asking, it stands for what the asking found.
+pub(crate) fn changes(page: usize) -> u32 {
+    const { assert!(PAGE == BLOCK) };
+    CHANGES[page & (CHANGES.len() - 1)].load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// All counts of `[start, end)` as one: unchanged exactly if each of them is
+/// (they only go up).
+pub(crate) fn changes_all(start: usize, end: usize) -> u64 {
+    (start / PAGE..end.div_ceil(PAGE)).fold(0, |sum, page| sum.wrapping_add(u64::from(changes(page))))
+}
+
+fn count(i: usize, n: u64) {
+    GUARD_STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn count_us(i: usize, since: std::time::Instant) {
+    count(i, since.elapsed().as_micros() as u64);
+}
 
 struct Guards {
     /// Blocks we made read-only.
@@ -407,8 +467,9 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// before the caller copies them; and whether all its blocks are guarded
+/// and clean now. `None` if the memory is not a view.
+fn guard_held(start: usize, end: usize) -> Option<(Vec<usize>, bool)> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -438,7 +499,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return Some((written, true));
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -473,7 +534,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block);
         }
     }
-    Some(written)
+    let held = g.clean.range(first..last).count() == last - first;
+    Some((written, held))
+}
+
+#[cfg(test)]
+fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_held(start, end).map(|(written, _)| written)
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -607,6 +674,8 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
+        count(2, (to - from) as u64);
+        count(3, 1);
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
@@ -671,12 +740,30 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    count(5, blocks.len() as u64);
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    let mut i = 0;
+    while i < blocks.len() {
+        // Blocks in a row in one call, unless they are of several views.
+        let mut k = i + 1;
+        while k < blocks.len() && blocks[k] == blocks[k - 1] + 1 {
+            k += 1;
+        }
+        if !set(blocks[i], blocks[k - 1] + 1) && k > i + 1 {
+            for &block in &blocks[i..k] {
+                set(block, block + 1);
+            }
+        }
+        i = k;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        change(block);
     }
     !blocks.is_empty()
 }
@@ -690,6 +777,38 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// We wrote title memory `[at, at + len)` through a view of our own
+/// ([`crate::behind`]), and the bytes are there: the guards stay, and every
+/// guarded block over the pages counts as written ([`guard`] knows a block
+/// that is read-only and not clean).
+pub(crate) fn wrote_behind(at: usize, len: usize) {
+    note_written(&mut guards(), at, at.saturating_add(len));
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+}
+
+/// The guarded blocks of `[start, end)`, and those of the same pages at
+/// their other views, are no longer as their copies took them.
+fn note_written(g: &mut Guards, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    for block in clean {
+        g.clean.remove(&block);
+        change(block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
+    for block in aliased {
+        for alias in crate::inplace::pages_of(block * BLOCK) {
+            if g.clean.remove(&(alias / BLOCK)) {
+                change(alias / BLOCK);
+            }
+        }
+    }
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
@@ -755,7 +874,11 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            open(&mut g, at, end);
+            if crate::behind::on() {
+                note_written(&mut g, at, end);
+            } else {
+                open(&mut g, at, end);
+            }
         }
     }
     // A placed texture there changed with no descriptor written.
@@ -854,6 +977,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        change(block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -885,6 +1009,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            count(4, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

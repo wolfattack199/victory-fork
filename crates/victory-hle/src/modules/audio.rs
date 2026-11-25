@@ -673,6 +673,15 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    // The console decodes in hardware: never late because
+                    // the processors are busy (a few microseconds a pass).
+                    // SAFETY: a plain call on our own thread.
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                        };
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                    }
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.

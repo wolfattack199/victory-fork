@@ -758,10 +758,35 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// The planes of a present after the first, drawn over it
+/// (`VICTORY_PLANES=0`: only the first is shown).
+#[cfg(windows)]
+fn planes_shown() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANES").is_none_or(|v| v != "0"))
+}
+
+/// The first resource of a plane and the part of it that is shown.
+#[cfg(windows)]
+fn plane_source(plane: &Plane) -> Option<(This, Option<windows::Win32::Foundation::RECT>)> {
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources and, if any, as many
+    // rectangles of four 32-bit numbers.
+    let (resource, part) = unsafe {
+        let part = plane.source_rects.cast::<windows::Win32::Foundation::RECT>();
+        (*plane.resources, (!part.is_null()).then(|| part.read_unaligned()))
+    };
+    (!resource.is_null()).then_some((resource, part))
+}
+
+/// Shows the first resource of each plane in our window, the later planes
+/// laid over the first (a Series S title has its game picture on the first
+/// and its menus, videos and texts on a larger second one).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: every plane fills the screen (no placement), and the sources
+/// are expected in the common state.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -787,6 +812,8 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::pipeline::note_frame(crate::draw::drawn());
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -828,18 +855,39 @@ extern "system" fn present(
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        && let Some((resource, source)) = plane_source(plane)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        use crate::host::Layer;
         const COPY_SOURCE: u32 = 0x800;
+        const READ: u32 = 0x80;
+        let source = source.filter(|_| planes_shown());
+        // The planes over the first, and what each one's texture was.
+        let mut over = Vec::new();
+        if planes_shown() {
+            for i in 1..planes.min(4) as usize {
+                // SAFETY: the title passes `planes` plane descriptions.
+                let Some((r, part)) = unsafe { plane_parameters.add(i).as_ref() }.and_then(plane_source) else {
+                    continue;
+                };
+                if r == resource || over.iter().any(|(o, _)| *o == r) {
+                    continue;
+                }
+                if let Some(texture) = crate::resource::host_resource(r) {
+                    let state = crate::resource::host_transition(r, READ).map_or(READ, |(_, before)| before);
+                    over.push((r, Layer { texture, state, source: part }));
+                }
+            }
+        }
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let (over_of, over): (Vec<_>, Vec<_>) = over.into_iter().unzip();
+        let shown = host.present(&Layer { texture, state, source }, &over, frame);
         crate::resource::host_transition(resource, state);
+        for (r, layer) in over_of.into_iter().zip(&over) {
+            crate::resource::host_transition(r, layer.state);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
@@ -850,8 +898,8 @@ extern "system" fn present(
     S_OK
 }
 /// Logs the planes a present names (how many, and each one's resources'
-/// sizes and formats) whenever that layout changes: only the first
-/// resource of the first plane is shown ([`present`]).
+/// sizes and formats, the part shown and what else it says) whenever that
+/// layout changes: only the first resource of each is shown ([`present`]).
 #[cfg(windows)]
 fn note_planes(planes: u32, plane_parameters: *const Plane) {
     static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -875,6 +923,21 @@ fn note_planes(planes: u32, plane_parameters: *const Plane) {
                     layout.push_str(&format!(" {width}x{height} f{format}"));
                 }
                 None => layout.push_str(" (no texture)"),
+            }
+        }
+        if let Some((_, Some(r))) = plane_source(plane) {
+            layout.push_str(&format!(" part {},{}-{},{}", r.left, r.top, r.right, r.bottom));
+        }
+        if !plane.destination.is_null() {
+            // SAFETY: the plane lists one place per resource, of 8 bytes at least.
+            let at = unsafe { plane.destination.cast::<[f32; 2]>().read_unaligned() };
+            layout.push_str(&format!(" at {at:?}"));
+        }
+        // Words that are pointers differ from frame to frame: said as such.
+        for word in plane.rest {
+            match word {
+                0x1_0000_0000..=0x7fff_ffff_ffff => layout.push_str(" pointer"),
+                word => layout.push_str(&format!(" {word:#x}")),
             }
         }
         layout.push(']');

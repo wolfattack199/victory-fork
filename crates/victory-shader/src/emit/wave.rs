@@ -143,6 +143,9 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// What single lanes hold of a value whose lanes do not agree on one shape: a wave64
+    /// reduction's last step adds the lower half's result to every lane and reads lane 63.
+    pub of_lane: HashMap<(Value, u32), Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -180,8 +183,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, of_lane) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, of_lane });
         i = end + 1;
     }
     out
@@ -268,7 +271,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Shapes {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -688,18 +691,19 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
+/// [`Section::shapes`] and [`Section::of_lane`].
+type Shapes = (HashMap<Value, Shape>, HashMap<(Value, u32), Shape>);
+
+/// The shape of each value, where every lane agrees on one, and else of the
+/// lanes that hold what is the same whichever lane reads it.
+fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32) -> Shapes {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
+    let mut of_lane = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
@@ -727,9 +731,18 @@ fn shapes(
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
+            continue;
+        }
+        for (l, &s) in lanes.iter().enumerate() {
+            // (a lane's own value is that lane's alone)
+            if !matches!(s, Sym::Own(_))
+                && let Some(sh) = single(s)
+            {
+                of_lane.insert((v, l as u32), sh);
+            }
         }
     }
-    out
+    (out, of_lane)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {

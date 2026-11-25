@@ -412,6 +412,30 @@ impl Bools {
         r
     }
 
+    /// What `b` says of the [`Atom::Uniform`]s alone, which every lane of the
+    /// wave has alike: that some value of the other atoms satisfies it.
+    fn of_wave(&mut self, b: Bool, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        if v == TERMINAL {
+            return b;
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let lo = self.of_wave(lo, memo);
+        let hi = self.of_wave(hi, memo);
+        let r = if matches!(self.atoms[v as usize], Atom::Uniform(_)) {
+            self.mk(v, lo, hi)
+        } else {
+            self.or(lo, hi)
+        };
+        memo.insert(b, r);
+        r
+    }
+
     /// `b` with every variable in `values` (sorted by variable) replaced by
     /// its value. Nothing below a node testing a later variable than the
     /// last of them changes.
@@ -644,6 +668,27 @@ struct SopMasks {
 }
 
 const MAX_ROUNDS: usize = 256;
+
+thread_local! {
+    /// Set by [`trusting_active`], for its thread.
+    static TRUSTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with every tracked mask kept in [`Structured::active`], also one
+/// not shown to hold only lanes that reach its block (`finish`): right unless
+/// EXEC was widened inside the block, which that check cannot always tell
+/// from a mask it merely knows too little of. For programs that would
+/// otherwise be refused.
+pub(crate) fn trusting_active<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TRUSTING.set(self.0);
+        }
+    }
+    let _restore = Restore(TRUSTING.replace(true));
+    f()
+}
 
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program) -> Result<Self, ShaderError> {
@@ -926,13 +971,19 @@ impl<'a> Lanes<'a> {
         let masks: HashMap<Value, Bool> = self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect();
         // A mask is only safe to ballot at its defining block when every lane
         // whose bit can be set in `m` actually reaches that block (`m => cond[b]`).
+        // What the wave decides together it decides for all lanes that come to it:
+        // a lane that is not there for that reason leaves the block to none.
         // Masks written after EXEC was widened inside a divergent block (e.g.
         // restoring a saved EXEC mask or a compare under widened EXEC) can hold
         // bits for inactive lanes and must not stay in `active`.
+        let trusting = TRUSTING.get();
         self.active.retain(|lo| {
             let Some(&m) = masks.get(lo) else {
                 return false;
             };
+            if trusting {
+                return true;
+            }
             let def_block = self
                 .defs
                 .get(lo)
@@ -940,7 +991,12 @@ impl<'a> Lanes<'a> {
                 .or_else(|| self.phis.get(lo).map(|&(b, _)| b));
             match def_block {
                 None => true,
-                Some(block) => self.b.implies(m, cond[block]),
+                Some(block) if self.b.implies(m, cond[block]) => true,
+                Some(block) => {
+                    let wave = self.b.of_wave(cond[block], &mut Map::default());
+                    let m = self.b.and(m, wave);
+                    !self.b.overflow && self.b.implies(m, cond[block])
+                }
             }
         });
         Ok(Structured {
@@ -999,6 +1055,28 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The pair that two `s_mov_b32` copied into `k`, one half each, where one
+    /// scalar operation wrote that pair (or two such moves did).
+    fn moved_halves(&self, k: Key) -> Option<Key> {
+        let from = |v: Value| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            match &inst.fields {
+                Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => match *src.first()? {
+                    Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        if k.0 == k.1 {
+            return None;
+        }
+        let pair = (from(k.0)?, from(k.1)?);
+        let &at = self.defs.get(&pair.0)?;
+        (self.defs.get(&pair.1) == Some(&at) || self.moved_halves(pair).is_some()).then_some(pair)
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -1034,6 +1112,15 @@ impl<'a> Lanes<'a> {
                 // lowering has no value for the low dword (EXEC, compares)
                 // and refuses. Give the atom both dwords when such code
                 // turns up.
+                // (a copy half by half of what one scalar operation wrote is followed)
+                let copied = match m {
+                    None => self.moved_halves(k).map(|from| self.mask(from)),
+                    Some(_) => None,
+                };
+                let m = match copied {
+                    Some((m, false)) => Some(m),
+                    _ => m,
+                };
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -1986,6 +2073,30 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn trusting_active_keeps_every_tracked_mask_and_ends() {
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0:  v_cmp_eq_u32 s2, 0, v0
+                0xBE80_3C02, // 8:  s_and_saveexec_b32 s0, s2
+                0xBF88_0002, // 12: s_cbranch_execz +2 (-> 24)
+                0xBEFE_0300, // 16: s_mov_b32 exec_lo, s0
+                0xBE84_037E, // 20: s_mov_b32 s4, exec_lo
+                S_ENDPGM,    // 24: s_endpgm
+            ],
+            false,
+        );
+        let b1 = p.blocks.iter().find(|b| b.offset == 16).expect("block 1");
+        let copied = b1.insts[1].write(Reg::S(4)).unwrap();
+        assert!(!structure(&p).unwrap().active.contains(&copied));
+        let trusting = trusting_active(|| structure(&p).unwrap());
+        assert!(trusting.active.contains(&copied));
+        assert!(trusting.active.iter().all(|v| trusting.masks.contains_key(v)));
+        // And only for as long as it runs.
+        assert!(!structure(&p).unwrap().active.contains(&copied));
     }
 
     #[test]

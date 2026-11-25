@@ -174,14 +174,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).map_err(|e| e.to_string())?;
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
@@ -417,6 +414,12 @@ pub(crate) fn host_pipeline_now<'a>(this: This) -> Option<&'a host::HostPipeline
 pub(crate) fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// At every present: the draws recorded since the start.
+#[cfg(windows)]
+pub(crate) fn note_frame(drawn: u64) {
+    make::note_frame(drawn);
 }
 
 /// Host pipelines queued and not made yet.

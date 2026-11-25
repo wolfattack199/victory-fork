@@ -35,6 +35,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// For each page: the part of it known to be as title memory is, as long
+    /// as the guards' count of the page ([`crate::watch::changes`]) is what
+    /// it was: the count, the last byte and the first (32, 16 and 16 bits);
+    /// [`NOT_QUIET`] if none is.
+    quiet: Vec<AtomicU64>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1197,7 +1202,12 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // (`VICTORY_WIDE_THREADS`: how many, 1 to 16.)
+        let n = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -2151,6 +2161,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            quiet: (0..pages).map(|_| AtomicU64::new(NOT_QUIET)).collect(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2380,12 +2391,12 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
-                crate::watch::writing(start + at, n);
+                let behind = crate::host::title_write(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
                 for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    crate::host::write_title(&behind, start + at + off, title[off..].as_ptr(), len);
                     written += len;
                 }
             }
@@ -2476,9 +2487,9 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
+        let behind = crate::host::title_write(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_title(&behind, start + at, title.as_ptr(), n);
         n
     }
 
@@ -2691,19 +2702,27 @@ impl Shadow {
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
+            if self.quiet_over(a, e) {
+                crate::watch::quiet();
+                continue;
+            }
+            let counts = counts(a, e);
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written, held)) = crate::watch::writes_held(a, e, true) else {
                 return true;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            if stale.is_empty() && held {
+                self.note_quiet(a, e, &counts);
+            }
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -2858,9 +2877,17 @@ impl Shadow {
     /// write: what is copied goes into the snapshot too.
     fn update_free(&self, from: usize, to: usize, snapshot: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if !snapshot && self.quiet_over(from, to) {
+                crate::watch::quiet();
+                return 0;
+            }
+            let counts = counts(from, to);
+            if let Some((now, written, held)) = crate::watch::writes_held(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written, snapshot);
+                if held {
+                    self.note_quiet(from, to, &counts);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2936,6 +2963,44 @@ impl Shadow {
             }
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
+        }
+    }
+
+    /// Whether all of `[from, to)` (inside the buffer) is known to be as
+    /// title memory is, with nobody asked ([`Shadow::quiet`]).
+    fn quiet_over(&self, from: usize, to: usize) -> bool {
+        let base = self.start as usize / PAGE;
+        (from / PAGE..to.div_ceil(PAGE)).all(|page| {
+            let known = self.quiet[page - base].load(Ordering::Acquire);
+            let (lo, hi) = part(page, from, to);
+            known != NOT_QUIET
+                && (known >> 32) as u32 == crate::watch::changes(page)
+                && (known & 0xffff) as usize <= lo
+                && hi <= (known >> 16 & 0xffff) as usize
+        })
+    }
+
+    /// `[from, to)` is as title memory was when the guards' counts of its
+    /// pages were `counts`, and its blocks are guarded.
+    fn note_quiet(&self, from: usize, to: usize, counts: &[u32]) {
+        let base = self.start as usize / PAGE;
+        for (page, &count) in (from / PAGE..to.div_ceil(PAGE)).zip(counts) {
+            if count == u32::MAX {
+                continue;
+            }
+            let (mut lo, mut hi) = part(page, from, to);
+            let known = self.quiet[page - base].load(Ordering::Acquire);
+            if known != NOT_QUIET && (known >> 32) as u32 == count {
+                // Together with what was known, if the two meet.
+                let (a, b) = ((known & 0xffff) as usize, (known >> 16 & 0xffff) as usize);
+                if a <= hi + 1 && lo <= b + 1 {
+                    (lo, hi) = (lo.min(a), hi.max(b));
+                } else if b - a > hi - lo {
+                    continue;
+                }
+            }
+            let known = u64::from(count) << 32 | (hi as u64) << 16 | lo as u64;
+            self.quiet[page - base].store(known, Ordering::Release);
         }
     }
 
@@ -3159,9 +3224,9 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
+                let behind = crate::host::title_write(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::write_title(&behind, start + at, title.as_ptr(), n);
                 written = n;
             }
         } else {
@@ -3238,11 +3303,24 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::writing(start + at, n);
+        let behind = crate::host::title_write(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_title(&behind, start + at, title.as_ptr(), n);
         n
     }
+}
+
+/// Nothing of a page is known to be as title memory is ([`Shadow::quiet`]).
+const NOT_QUIET: u64 = u64::MAX;
+
+/// The guards' counts of the pages of `[from, to)`.
+fn counts(from: usize, to: usize) -> Vec<u32> {
+    (from / PAGE..to.div_ceil(PAGE)).map(crate::watch::changes).collect()
+}
+
+/// The first and the last byte in `page` of the part of it in `[from, to)`.
+fn part(page: usize, from: usize, to: usize) -> (usize, usize) {
+    (from.saturating_sub(page * PAGE), (to - page * PAGE).min(PAGE) - 1)
 }
 
 struct Entry {

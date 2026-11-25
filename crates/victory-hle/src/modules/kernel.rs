@@ -314,6 +314,11 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
     if load {
+        if switched_off(&file) {
+            tracing::warn!(dll = file, "refused: VICTORY_REFUSE_DLLS names it");
+            host::set_last_error(ERROR_MOD_NOT_FOUND);
+            return Some(std::ptr::null_mut());
+        }
         match runtime::load_title_dll(&file) {
             Ok(Some(base)) => return Some(base as *mut c_void),
             Ok(None) => {}
@@ -344,6 +349,16 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     refuse(&file);
     host::set_last_error(ERROR_MOD_NOT_FOUND);
     Some(std::ptr::null_mut())
+}
+
+/// Whether the title is to be without this DLL of its own
+/// (`VICTORY_REFUSE_DLLS=<name>,<name>`): what it does without one, an
+/// upscaler's say, tells what the DLL is needed for.
+fn switched_off(file: &str) -> bool {
+    static LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| std::env::var("VICTORY_REFUSE_DLLS").unwrap_or_default())
+        .split(',')
+        .any(|name| !name.is_empty() && name.trim().eq_ignore_ascii_case(file))
 }
 
 /// Logs a DLL name the title is refused, once.

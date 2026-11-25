@@ -15,6 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod behind;
+#[cfg(windows)]
+mod calm;
+#[cfg(windows)]
+mod heap;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -51,6 +57,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod slabs;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 mod switch;
@@ -64,7 +72,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,

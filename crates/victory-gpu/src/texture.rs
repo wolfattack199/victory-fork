@@ -45,6 +45,11 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The bytes of the upload buffer it is the start of (`crate::slabs`),
+    /// and whether what it holds is its own: a buffer that was used before
+    /// holds another texture until this one is first detiled into it.
+    capacity: u64,
+    own: std::sync::atomic::AtomicBool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -79,6 +84,10 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The guards' counts of its blocks (`crate::watch::changes_all`) when
+    /// they were found guarded and unwritten: as long as they are these,
+    /// nothing happened to the texture.
+    quiet: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -401,6 +410,8 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Dropped by the last list that named it, after it ran.
+        crate::slabs::upload_done(&self.buffer, self.data, self.capacity);
     }
 }
 
@@ -437,6 +448,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    crate::slabs::let_go_idle();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -629,6 +641,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
+    // Textures placed in blocks (`crate::slabs`) may lie where others did:
+    // said once per list, before the first of its uploads.
+    const BLOCKS: usize = usize::MAX - 0x5d;
+    if crate::slabs::blocks_wanted() && list.first_use(BLOCKS) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            ..Default::default()
+        };
+        // SAFETY: an open list; the barrier names no resource.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
@@ -901,6 +924,12 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        // Nothing was detiled (no page of it is there): zeros, as in a
+        // buffer never used before.
+        if !self.own.swap(true, Relaxed) {
+            // SAFETY: the mapped buffer has `bytes` bytes; written only at submission.
+            unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -919,6 +948,14 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        const HASH_EVERY: u64 = 8;
+        let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+        let counts = crate::watch::changes_all(start, start + size);
+        if !turn && last.quiet == Some(counts) {
+            // Nothing happened to its blocks since they were found clean.
+            crate::watch::quiet();
+            return 0;
+        }
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -946,12 +983,11 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written, held)) = waited(1, || crate::watch::writes_held(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            last.quiet = (unwritten && held).then_some(counts);
             if unwritten && !turn {
                 return 0;
             }
@@ -1064,6 +1100,7 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            last.quiet = None;
             0
         }
     }
@@ -1117,6 +1154,7 @@ impl Staging {
                 return;
             }
         }
+        self.own.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1418,7 +1456,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, capacity, used) = crate::slabs::upload(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1438,6 +1476,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        capacity,
+        own: std::sync::atomic::AtomicBool::new(!used),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

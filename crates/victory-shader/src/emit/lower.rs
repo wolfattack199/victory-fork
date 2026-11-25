@@ -1809,6 +1809,55 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// What `v_readlane_b32` `inst` reads of a whole-wave section before it in its block,
+    /// where the lane it names holds that and others do not.
+    fn section_lane(&self, inst: &Inst, v: &crate::gfx10::Valu) -> Option<super::wave::Shape> {
+        let (Operand::Vector { reg, .. }, lane) = (*v.src.first()?, v.src.get(1)?) else {
+            return None;
+        };
+        let lane = match *lane {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        let x = inst.read(Reg::V(reg))?;
+        let sections = self.sections.get(&self.cur_ir)?;
+        sections.values().find_map(|s| s.of_lane.get(&(x, lane)).copied())
+    }
+
+    /// The scalar `v_writelane_b32` put into the lane `v_readlane_b32` `inst` reads, followed
+    /// back over the other lanes' writes to the VGPR in between.
+    fn parked_lane(&self, inst: &Inst, v: &crate::gfx10::Valu) -> Option<Value> {
+        let lane = |op: &Operand| match *op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            _ => None,
+        };
+        let (Operand::Vector { reg, .. }, at) = (*v.src.first()?, lane(v.src.get(1)?)?) else {
+            return None;
+        };
+        let mut x = inst.read(Reg::V(reg))?;
+        loop {
+            let block = &self.x.p.blocks[*self.def_block.get(&x)?];
+            let w = block.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == x))?;
+            let Fields::Valu(f) = &w.fields else {
+                return None;
+            };
+            let (Some(Operand::Vector { reg, .. }), [from, to]) = (f.dst, &f.src[..]) else {
+                return None;
+            };
+            if w.name() != "v_writelane_b32" {
+                return None;
+            }
+            if lane(to)? == at {
+                return match *from {
+                    Operand::Scalar { code, .. } if code != NULL => w.read(Reg::S(code)),
+                    _ => None,
+                };
+            }
+            x = w.read(Reg::V(reg))?;
+        }
+    }
+
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
@@ -2184,6 +2233,13 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        // A buffer load past the caches (`globallycoherent`) reads what another group may
+        // just have written; without it a loop waiting for that need never see it.
+        self.s.coherent = self.x.native.stage == HwStage::Cs
+            && order.iter().flat_map(|&b| &p.blocks[b].insts).any(|i| {
+                i.name().starts_with("buffer_load")
+                    && matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc && cache.dlc)
+            });
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -3157,6 +3213,11 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            Operand::Const(253) => {
+                let scc = self.scc_in(inst)?;
+                let t = self.s.t.i32;
+                Ok(self.s.m.cast(self.cur, Cast::ZExt, scc, t))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3777,7 +3838,10 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // (but for the approximate form that takes every mask per host wave: then this one too,
+        // which is all a loop waiting for what its lanes wait for needs)
+        let apart = self.local && !self.local_any || self.exchange.is_none() && self.halves.is_some();
+        if !self.console_lanes || apart {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -3790,7 +3854,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
@@ -5505,10 +5569,38 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
-        match self.get(v)? {
-            Val::Bit(x) => Ok(x),
-            _ => Err("SCC without a value"),
+        match self.get(v) {
+            Ok(Val::Bit(x)) => Ok(x),
+            Ok(_) => Err("SCC without a value"),
+            // A mask operation's: "some lane is set", which the lanes running there can say
+            // if it is no other's that is (see `mask_dword`).
+            Err(_) if self.mask_data == MaskData::Console && self.x.st.scc_some.contains_key(&v) => {
+                let made = self.def_block.get(&v).copied();
+                let pair = self.exchange.is_some() && !self.local;
+                let whole = pair && made.is_none_or(|b| self.all_lanes(b));
+                if !whole && !self.scc_of_active(v) {
+                    if pair {
+                        need(made.unwrap_or(0));
+                    }
+                    return Err(MASK_ELSEWHERE);
+                }
+                self.scc_some(v)
+            }
+            Err(why) => Err(why),
         }
+    }
+
+    /// Whether the mask operation that sets `scc` leaves no lane's bit set that does not run
+    /// there, so that the lanes there can say whether some bit is.
+    fn scc_of_active(&self, scc: Value) -> bool {
+        let Some(&b) = self.def_block.get(&scc) else {
+            return false;
+        };
+        self.x.st.scc_some.contains_key(&scc)
+            && self.x.p.blocks[b].insts.iter().any(|i| {
+                i.write(Reg::Scc) == Some(scc)
+                    && i.writes.iter().any(|&(r, w)| matches!(r, Reg::S(_)) && self.x.st.active.contains(&w))
+            })
     }
 
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
@@ -7285,6 +7377,32 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            // Four 8-bit products added to an accumulator: the result's own
+            // register (`v_dot4c`) or the third source.
+            "v_dot4c_i32_i8" | "v_dot4_i32_i8" | "v_dot4_u32_u8" => {
+                let accumulates = name == "v_dot4c_i32_i8";
+                if v.clamp || v.neg_hi != 0 || v.opsel & 4 != 0 || accumulates && v.opsel != 0 {
+                    return Err("modifiers on an 8-bit dot product");
+                }
+                let (mut a, mut bb) = (s(self, 0)?, s(self, 1)?);
+                let acc = if accumulates {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                    self.i32_of(acc)?
+                } else {
+                    a = self.halves_of(a, v.opsel & 1 != 0, v.opsel_hi & 1 != 0);
+                    bb = self.halves_of(bb, v.opsel & 2 != 0, v.opsel_hi & 2 != 0);
+                    s(self, 2)?
+                };
+                let op = if name == "v_dot4_u32_u8" { 164 } else { 163 };
+                let i32t = self.s.t.i32;
+                let r = self
+                    .s
+                    .op(c, "dot4AddPacked.i32", Attr::ReadNone, i32t, op, &[acc, a, bb]);
+                int(self, r)
+            }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = if name == "v_mad_legacy_f32" {
@@ -7657,6 +7775,16 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                if let Some(shape) = self.section_lane(inst, v) {
+                    let r = self.shape(shape, false)?;
+                    return int(self, r);
+                }
+                // A scalar the compiler parked in that lane of a VGPR it also uses otherwise
+                // (`unspill` takes the others).
+                if let Some(x) = self.parked_lane(inst, v) {
+                    let r = self.i32_of(x)?;
+                    return int(self, r);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -8556,6 +8684,48 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// A packed source of the two-operand encoding, which has no selectors:
+    /// each half of the result reads the same half of a VGPR.
+    fn packed_vop2(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.abs != 0 || v.neg != 0 || v.opsel != 0 {
+            return Err("modifiers on a packed accumulation");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        if !matches!(op, Operand::Vector { .. }) {
+            return Err("a packed accumulation of a scalar");
+        }
+        let x = self.operand(inst, &op)?;
+        Ok(self.half(x, high))
+    }
+
+    /// `x` with its low half taken from the high one (`low`) and its high half
+    /// from the low one (not `high`), as op_sel and op_sel_hi select them.
+    fn halves_of(&mut self, x: V, low: bool, high: bool) -> V {
+        if !low && high {
+            return x;
+        }
+        let c = self.cur;
+        let l = self.half(x, low);
+        let h = self.half(x, high);
+        let k16 = self.s.m.i32(16);
+        let h = self.s.m.bin(c, Bin::Shl, h, k16);
+        self.s.m.bin(c, Bin::Or, l, h)
+    }
+
+    /// The high or low 16 bits of `x`.
+    fn half(&mut self, x: V, high: bool) -> V {
+        let c = self.cur;
+        if high {
+            let k16 = self.s.m.i32(16);
+            return self.s.m.bin(c, Bin::LShr, x, k16);
+        }
+        let m = self.s.m.i32(0xFFFF);
+        self.s.m.bin(c, Bin::And, x, m)
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
@@ -8563,8 +8733,11 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let float = op.ends_with("_f16");
+        // The accumulator is the result's register, each half its own.
+        let accumulates = op == "fmac_f16";
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
+            "fmac_f16" => 2,
             "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
             | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
@@ -8579,7 +8752,11 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high, float)?;
+                let h = if accumulates {
+                    self.packed_vop2(inst, k, high)?
+                } else {
+                    self.packed_src(inst, k, high, float)?
+                };
                 if float {
                     let mut f = self
                         .s
@@ -8593,6 +8770,15 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if accumulates {
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("an accumulator");
+                };
+                let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                let acc = self.i32_of(acc)?;
+                let h = self.half(acc, high);
+                xs.push(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]));
             }
             let r = if float {
                 let mut f = match op {
@@ -9731,7 +9917,7 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -9820,9 +10006,11 @@ impl<'a> Lower<'a> {
                 return Err("an image store to a mip level");
             }
             // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // float format (the console converts by the view's format). The
+            // channels left out of `dmask` are written as 0; the others lie
+            // in consecutive data.
+            if *dmask == 0 {
+                return Err("an image store of no channel");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -9833,7 +10021,12 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            for channel in 0..4u8 {
+                if *dmask >> channel & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                let k = (*dmask & ((1 << channel) - 1)).count_ones() as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;

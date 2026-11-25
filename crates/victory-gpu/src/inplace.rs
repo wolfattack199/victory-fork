@@ -289,6 +289,33 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    crate::behind::section_made(section, bytes);
+}
+
+/// The runtime is about to close a section: its handle may be another's next.
+pub fn title_memory_section_gone(section: usize) {
+    views().sections.retain(|s| s.0 != section);
+    crate::behind::section_gone(section);
+}
+
+/// What the title's views show at `[at, at + len)`: address, bytes, section
+/// and offset in it, in address order; `None` if part of it is no view.
+pub(crate) fn shown(at: usize, len: usize) -> Option<Vec<(usize, usize, usize, u64)>> {
+    let end = at.checked_add(len)?;
+    let v = views();
+    let first = *v.views.range(..=at).next_back()?.0;
+    let mut pieces = Vec::new();
+    let mut next = at;
+    for (&base, &(bytes, section, offset)) in v.views.range(first..end) {
+        if base > next || base + bytes <= next {
+            return None;
+        }
+        let n = (base + bytes).min(end) - next;
+        pieces.push((next, n, section, offset + (next - base) as u64));
+        next += n;
+    }
+    (next >= end).then_some(pieces)
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

@@ -1137,6 +1137,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Its place in a block of the card's memory (`crate::slabs`), given
+    /// back after the texture (the fields are dropped in this order).
+    slot: Option<crate::slabs::Slot>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1341,7 +1344,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved =
+                if partly { host_texture_as(&r.desc, r.host.state, clear, true).map(|(t, _)| t) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1354,10 +1358,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => Some((texture, None)),
             None => host_texture(&r.desc, r.host.state, clear),
         };
-        let Some(texture) = texture else {
+        let Some((texture, slot)) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1378,6 +1382,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.slot = slot;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1942,6 +1947,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            slot: None,
         }
     }
 
@@ -1959,6 +1965,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            slot: None,
         }
     }
 }
@@ -2030,7 +2037,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::slabs::Slot>)> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2042,7 +2049,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::slabs::Slot>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2092,6 +2099,19 @@ fn host_texture_as(
         }
         value
     });
+    // A texture the title fills is placed in a block (`crate::slabs`).
+    if !reserved && fills(desc) && clear_value.is_none() && desc.sample_count <= 1 {
+        let state =
+            D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let wanted = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+        if let Some((texture, slot)) = crate::slabs::texture(&host.device, wanted, state) {
+            crate::host::name(&texture, || {
+                format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            });
+            return Some((texture, Some(slot)));
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2137,7 +2157,7 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|texture| (texture, None))
 }
 
 /// The host copy of title texture `this` if it is made and was made

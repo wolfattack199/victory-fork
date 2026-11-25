@@ -67,6 +67,23 @@
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
 //! Unknown versions are rejected so a format change shows up as an error.
+//!
+//! The title's upscaler library has no `DXIL` parts: its compute programs
+//! lie unpacked in an `ACCC` part ([`packaged`]), as observed there:
+//!
+//! ```text
+//! +0x00 "FSPX"  u32 version (1), u32 section count, u32 size
+//! +0x10 sections of 16 B: u32 kind, u32 offset, u32 size, u32 0 (the kind
+//!       is the word before the offset)
+//! kind 0  +0x0c u16 x3 thread-group size, u16 flags (bit 4 wave32, else
+//!         wave64), +0x14 u32 COMPUTE_PGM_RSRC1, +0x18 u32 COMPUTE_PGM_RSRC2
+//! kind 1  a hash and zeroes (not read)
+//! kind 6  the GFX10 code
+//! kind 7  24 B (u32 0x403, u32 size of the rest, u32 code dwords, u32 x2 0,
+//!         u32 records << 15 | 0x440), then records of 32 B:
+//!         u32 0x41, a used resource as above (20 B), u32 -1, u32 0
+//!         u32 0x42, what the HLSL declared (not read); u32 0x43, the hash
+//! ```
 
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
@@ -432,6 +449,113 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// The native programs of a container, wherever it keeps them; none if it
+/// has no part for them.
+pub fn container_programs(c: &crate::Container) -> Result<Vec<NativeProgram>, ShaderError> {
+    match (c.part(crate::FourCC::DXIL), c.part(crate::FourCC::ACCC)) {
+        (Some(part), _) => native_programs(part.data),
+        (None, Some(part)) => Ok(vec![packaged(part.data)?]),
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+const FSPX_HEADER: usize = 0x10;
+const FSPX_WAVE32: u32 = 1 << 4;
+const FSPX_TABLES_HEADER: usize = 0x18;
+const FSPX_RECORD: usize = 0x20;
+const FSPX_USED: u32 = 0x41;
+
+/// The compute program of an `ACCC` part. The container keeps no table of
+/// where the root parameters arrive: it follows from the resources used.
+fn packaged(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if part.get(0..4) != Some(b"FSPX") {
+        return Err(Malformed("packaged program lacks FSPX magic"));
+    }
+    if u32_at(part, 4)? != 1 {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX section count"));
+    }
+    let section = |kind: u32, what: &'static str| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into()).ok_or(Malformed(what));
+            }
+        }
+        Err(Malformed(what))
+    };
+    let registers = section(0, "FSPX registers")?;
+    let code = section(6, "FSPX code")?;
+    let tables = section(7, "FSPX tables")?;
+    let (x_y, z_flags) = (u32_at(registers, 0x0c)?, u32_at(registers, 0x10)?);
+    let (rsrc1, rsrc2) = (u32_at(registers, 0x14)?, u32_at(registers, 0x18)?);
+    let wave64 = z_flags >> 16 & FSPX_WAVE32 == 0;
+    let records = tables.get(FSPX_TABLES_HEADER..).ok_or(Malformed("FSPX tables"))?;
+    let mut used = Vec::new();
+    for e in records.as_chunks::<FSPX_RECORD>().0 {
+        if le32(e, 0) == FSPX_USED {
+            used.push(used_resource(&e[4..4 + ENTRY_SIZE as usize]));
+        }
+    }
+    let mut layout: Vec<RootParam> = Vec::new();
+    for u in &used {
+        let sgprs = match u.root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // Words in the code, no register of their own.
+            RootType::ImmediateSampler => continue,
+            _ => return Err(Malformed("an FSPX root parameter of another type")),
+        };
+        if layout.iter().all(|p| p.user_data != u.user_data) {
+            layout.push(RootParam {
+                root: u.root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        // In granules of 4 (8 for half the lanes).
+        vgprs: ((rsrc1 & 0x3F) as u16 + 1) * if wave64 { 4 } else { 8 },
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2,
+            threads: [x_y & 0xFFFF, x_y >> 16, z_flags & 0xFFFF],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// A used-resource table's entry.
+fn used_resource(e: &[u8]) -> UsedResource {
+    UsedResource {
+        kind: match e[0] {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            n => ResourceType::Other(n),
+        },
+        root: RootType::from_raw(e[1].into()),
+        table_offset_dwords: le32(e, 4),
+        lower_bound: le32(e, 8),
+        stride: le32(e, 12),
+        dwords: e[16],
+        user_data: e[17],
+        slot: e[18],
+    }
+}
+
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     if blob.get(0..4) != Some(b"XBCH") {
         return Err(Malformed("native blob lacks XBCH magic"));
@@ -556,22 +680,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
             .iter()
-            .map(|e| UsedResource {
-                kind: match e[0] {
-                    0 => ResourceType::Srv,
-                    1 => ResourceType::Sampler,
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Uav,
-                    n => ResourceType::Other(n),
-                },
-                root: RootType::from_raw(e[1].into()),
-                table_offset_dwords: le32(e, 4),
-                lower_bound: le32(e, 8),
-                stride: le32(e, 12),
-                dwords: e[16],
-                user_data: e[17],
-                slot: e[18],
-            })
+            .map(|e| used_resource(e))
             .collect();
         // The record is in bounds, so its end is too.
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
@@ -1054,6 +1163,91 @@ mod tests {
             .map(|p| p.stage)
             .collect();
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
+    }
+
+    /// An `ACCC` part: registers, code and tables as the upscaler's programs
+    /// have them.
+    fn fspx(flags: u32, records: &[[u32; 8]]) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let registers = words(&[0x4005_CF00, 0x6C09_0102, 0, 0x0002_0040, flags << 16 | 3, 0x402C_0349, 0x190]);
+        let mut tables = words(&[0x403, 0, 2, 0, 0, (records.len() as u32) << 15 | 0x440]);
+        for r in records {
+            tables.extend(words(r));
+        }
+        let mut out = words(&[u32::from_le_bytes(*b"FSPX"), 1, 3, 0]);
+        let mut at = 0x10 + 3 * 16;
+        let sections = [(0u32, registers), (6, VS_CODE.to_vec()), (7, tables)];
+        for (kind, data) in &sections {
+            out.extend(words(&[*kind, at as u32, data.len() as u32, 0]));
+            at += data.len();
+        }
+        for (_, data) in &sections {
+            out.extend(data);
+        }
+        out
+    }
+
+    #[test]
+    fn reads_a_packaged_compute_program() {
+        let records = [
+            // u11 in a table at dword 88, two of a table's SRVs, b0, an immediate sampler.
+            [0x41, 0x303, 88, 11, 1, 0x0404, u32::MAX, 0],
+            [0x41, 0x300, 8, 17, 1, 0x1_0504, u32::MAX, 0],
+            [0x41, 0x300, 16, 18, 4, 0x1_0508, u32::MAX, 0],
+            [0x41, 0x102, 0, 0, 0, 0x2_0602, u32::MAX, 0],
+            [0x41, 0x401, 0, 0, 0, 0x0004, u32::MAX, 0],
+            [0x42, 0, 0x000B_0101, 11, 0, 0, u32::MAX, 0],
+        ];
+        let bytes = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx(0x10, &records))]);
+        let c = crate::Container::parse(&bytes).unwrap();
+        let found = container_programs(&c).unwrap();
+        let [p] = &found[..] else { panic!("{found:?}") };
+        assert_eq!((p.stage, p.wave64, p.vgprs), (HwStage::Cs, false, 80));
+        assert_eq!(p.code, VS_CODE);
+        assert_eq!(
+            p.io,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0x190,
+                threads: [64, 2, 3],
+            })
+        );
+        let roots: Vec<_> = p.layout.iter().map(|l| (l.root, l.sgprs, l.user_data, l.slot)).collect();
+        assert_eq!(
+            roots,
+            [
+                (RootType::Table, 1, 4, 0),
+                (RootType::Table, 1, 5, 1),
+                (RootType::Descriptor, 2, 6, 2),
+            ]
+        );
+        let kinds: Vec<_> = p.used.iter().map(|u| (u.kind, u.table_offset_dwords, u.lower_bound, u.dwords)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (ResourceType::Uav, 88, 11, 4),
+                (ResourceType::Srv, 8, 17, 4),
+                (ResourceType::Srv, 16, 18, 8),
+                (ResourceType::Cbv, 0, 0, 2),
+                (ResourceType::Sampler, 0, 0, 4),
+            ]
+        );
+        // Without the flag: 64 lanes a wave, granules of 4 registers.
+        let p = packaged(&fspx(0, &records)).unwrap();
+        assert_eq!((p.wave64, p.vgprs), (true, 40));
+    }
+
+    #[test]
+    fn rejects_corrupt_packaged_programs() {
+        let good = fspx(0, &[]);
+        assert!(packaged(&good).is_ok());
+        for cut in [0, 3, 8, 0x20, 0x41, good.len() - 1] {
+            assert!(packaged(&good[..cut]).is_err(), "{cut}");
+        }
+        let mut other = good.clone();
+        other[4] = 2;
+        assert!(packaged(&other).is_err());
+        // Root constants: no such program was seen, so nothing says how many registers.
+        assert!(packaged(&fspx(0, &[[0x41, 0x002, 0, 0, 0, 0x0401, u32::MAX, 0]])).is_err());
     }
 
     #[test]

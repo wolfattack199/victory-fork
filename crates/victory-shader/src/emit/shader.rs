@@ -157,6 +157,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// The program waits in memory for what other thread groups write: its
+    /// raw and structured UAVs are globally coherent.
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -213,6 +216,7 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -431,6 +435,11 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // (a raw (11) or structured (12) buffer, UAV bit 0x1000)
+        let mut props = props;
+        if self.coherent && !sampler && matches!(props.0 & 0x10ff, 0x100b | 0x100c) {
+            props.0 |= 0x4000;
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
