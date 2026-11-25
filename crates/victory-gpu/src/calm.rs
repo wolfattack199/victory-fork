@@ -18,6 +18,28 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// Raises the calling thread, one of ours that the title's frame waits for:
+/// `first` to where the title has the thread that submits (time critical,
+/// 15), else to where it has the threads that record (highest, 10).
+/// `VICTORY_THREAD_PRIORITY=0`: left as it is.
+///
+/// The title's recording threads are pinned and raised as on the console,
+/// and its submitting thread waited for threads of ours at the ordinary
+/// priority: with every processor taken (the driver's compiler, the readers
+/// of files, what else the system runs) those were the last to run.
+pub(crate) fn raise(first: bool) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_PRIORITY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let priority = if first { THREAD_PRIORITY_TIME_CRITICAL } else { THREAD_PRIORITY_HIGHEST };
+    // SAFETY: the calling thread's own priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
 /// What the runtime calls the threads.
 const NAME: &str = "D3D Background Thread";
 
@@ -42,13 +64,22 @@ pub(crate) fn start() {
     }
     let _ = std::thread::Builder::new().name("victory-calm".into()).spawn(move || {
         let mut seen = HashSet::new();
+        let mut looks = 0u32;
         loop {
-            // They are made with the first pipelines and kept.
+            // They are made with the first pipelines and kept: looked for
+            // less and less (a look is a snapshot of the whole system's
+            // threads, mapped into this process).
             let found = calm(n, &mut seen);
             if found > 0 {
                 tracing::info!(threads = found, processors = n, "driver background threads kept on the last processors");
+                looks = 0;
             }
-            std::thread::sleep(Duration::from_secs(if seen.is_empty() { 2 } else { 10 }));
+            looks += 1;
+            std::thread::sleep(Duration::from_secs(match (seen.is_empty(), looks) {
+                (true, _) => 2,
+                (false, ..6) => 10,
+                (false, _) => 120,
+            }));
         }
     });
 }

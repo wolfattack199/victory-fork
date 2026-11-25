@@ -3584,6 +3584,7 @@ fn land_soon() {
             std::thread::Builder::new()
                 .name("victory-land".into())
                 .spawn(|| {
+                    crate::calm::raise(false);
                     loop {
                         {
                             let mut told = LANDED.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -3614,6 +3615,7 @@ fn late_helper() {
         return;
     };
     crate::framelog::keep_on_fast_cores("victory-late-wait");
+    crate::calm::raise(false);
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
@@ -3737,6 +3739,7 @@ fn relay_worker() {
         return;
     };
     crate::framelog::keep_on_fast_cores("victory-relay");
+    crate::calm::raise(true);
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));

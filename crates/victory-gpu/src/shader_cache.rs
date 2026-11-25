@@ -77,7 +77,32 @@ fn build() -> [u8; 32] {
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     h.update(include_bytes!("shader_cache.rs"));
+    // The lists this file reads for the translator (`translate_listed`): the
+    // shader crate's fingerprint does not see them.
+    for name in ["VICTORY_WAVE_WIDE_ONLY", "VICTORY_FIRSTLANE_OWN_ONLY"] {
+        h.update(name.as_bytes());
+        h.update(b"=");
+        if let Some(value) = std::env::var_os(name) {
+            h.update(value.as_encoded_bytes());
+        }
+        h.update(b"\0");
+    }
     *h.finalize().as_bytes()
+}
+
+/// A container translated with the forms this file allows it by its hash
+/// (the wave-wide form, the host wave's own first lane: [`WAVE_WIDE`],
+/// [`FIRSTLANE_OWN`]); for runs and the offline warm-up alike, which share
+/// the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    let hash = blake3::hash(c).to_hex();
+    victory_shader::emit::with_wave_wide(listed(&WAVE_WIDE, "VICTORY_WAVE_WIDE_ONLY", &WAVE_WIDE_DEFAULT, &hash), || {
+        victory_shader::emit::with_firstlane_own(
+            listed(&FIRSTLANE_OWN, "VICTORY_FIRSTLANE_OWN_ONLY", &FIRSTLANE_OWN_DEFAULT, &hash),
+            || victory_shader::emit::translate(c),
+        )
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
@@ -89,7 +114,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_listed(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -97,11 +122,51 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+/// The containers (by the 16-digit hash the log names shaders with) whose
+/// wave64 compute program may take the wave-wide form on a host of 32-lane
+/// waves (`victory_shader::emit::with_wave_wide`): `VICTORY_WAVE_WIDE_ONLY`,
+/// a list of hashes, or by default the four programs of this title that
+/// come out of it with 32-lane waves and otherwise do not run at all on
+/// such a host (the driver refuses their 64-lane form: water transmission
+/// volumetrics, both kinds; particle visibility; the tiling of the
+/// screen-space reflection pass). `VICTORY_WAVE_WIDE_ONLY=none` allows none.
+static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
+const WAVE_WIDE_DEFAULT: [&str; 4] = ["5dc3b25986622949", "6f225b641c5b0708", "369cbe906ea72764", "2cc4c197ee29e291"];
+
+/// The containers whose first-lane reads where not every lane runs take the
+/// host wave's own first lane (`victory_shader::emit::with_firstlane_own`):
+/// `VICTORY_FIRSTLANE_OWN_ONLY`, or by default the three programs of the
+/// ray-tracing structure builder (`XboxBvhBuilder.dll`) that need it to
+/// translate for 32-lane waves. Their scans read a sum of scalars, the same
+/// in every lane of the console wave, which is where the host wave's own
+/// first lane is exact; without them the builder's other 49 programs cannot
+/// run either (its stages run all or none, `crate::pipeline`).
+static FIRSTLANE_OWN: OnceLock<Vec<String>> = OnceLock::new();
+// (As the title passes them, then as `victory translate` finds them in the DLL.)
+const FIRSTLANE_OWN_DEFAULT: [&str; 6] = [
+    "39321a95223001ed",
+    "77360df21e12ea43",
+    "9fc111d3be79364f",
+    "dc78c5de69c7c155",
+    "322ed4ad832bdea6",
+    "d441b097704ab616",
+];
+
+/// Whether `hash` (a container's, in hex) is on the list `env` names (hashes
+/// separated by commas, `none` for none), or on `default` without it.
+fn listed(list: &OnceLock<Vec<String>>, env: &str, default: &[&str], hash: &str) -> bool {
+    let list = list.get_or_init(|| match std::env::var(env) {
+        Ok(v) => v.split(',').map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty() && h != "none").collect(),
+        Err(_) => default.iter().map(|h| h.to_string()).collect(),
+    });
+    list.iter().any(|h| hash.starts_with(h.as_str()))
 }
 
 /// The cache entry's converter: the build and the container in, the

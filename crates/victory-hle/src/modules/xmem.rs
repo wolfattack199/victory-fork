@@ -32,6 +32,10 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+/// `VirtualFree`'s flag that joins adjacent placeholders into one (not in
+/// windows-sys' memory module).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -425,7 +429,7 @@ fn shown() -> MutexGuard<'static, Shown> {
 
 /// What mapping cost since the last log line: calls of the title's and
 /// microseconds in them, the GPU's page-mapping copies (the next five:
-/// calls, microseconds, pages, pages that were as asked already, waits for
+/// calls, microseconds, pages, pages mapped in a run with others, waits for
 /// the page table's lock in microseconds), views unmapped, their pages,
 /// microseconds of that, the ones that reached past what was asked and the
 /// pages of those, views mapped, their pages, microseconds of that.
@@ -454,7 +458,7 @@ fn mapped_line() {
     let per: [f64; 15] = std::array::from_fn(|i| MAPPED[i].swap(0, Ordering::Relaxed) as f64 / seconds);
     tracing::info!(
         "title memory mapped anew, per second: {:.0} calls of the title's in {:.1} ms; {:.0} copies of page mappings in \
-         {:.1} ms, {:.0} pages, {:.0} of them as asked already, {:.1} ms waiting for the page table; {:.0} views of {:.0} pages \
+         {:.1} ms, {:.0} pages, {:.0} of them in runs, {:.1} ms waiting for the page table; {:.0} views of {:.0} pages \
          unmapped in {:.1} ms, {:.0} of them of {:.0} pages reached past what was asked; {:.0} views of {:.0} pages mapped in \
          {:.1} ms",
         per[0],
@@ -488,12 +492,18 @@ fn view_pages() -> usize {
     *PAGES
 }
 
-/// Whether the GPU's page-mapping copies leave a page alone that shows what
-/// it is to show already (`VICTORY_SAME_PAGES=1`; off by default). Needs the
-/// writes into physical pages to be acted on (`VICTORY_PAGE_WRITES=1`): the
-/// mapping was also what had a page's contents looked at again.
-fn same_pages() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_SAME_PAGES").is_some_and(|v| v == "1"));
+/// Whether the GPU's page-mapping copies map a run of consecutive pages of
+/// one section as one view (`VICTORY_MAP_RUNS=0`: page by page, as before).
+/// After pull request #823 by Felix2180.
+fn map_runs() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Whether writes into physical pages go through the view of a whole section
+/// that is there for good ([`View`]; `VICTORY_KEPT_VIEWS=0`: not).
+fn kept_views() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_KEPT_VIEWS").is_none_or(|v| v != "0"));
     *ON
 }
 
@@ -601,15 +611,31 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
+/// writable. Through the whole section's view of ours where there is one
+/// (`VICTORY_WRITE_BEHIND=1`); else mapped here, and unmapped when dropped:
+/// twelve DirectStorage workers did that for every request, each map and
+/// unmap under the address space's lock that the title's own mapping calls
+/// wait for, and each page faulted in anew.
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// The section's view, if `at` lies in it.
+    kept: Option<victory_gpu::TitleSectionView>,
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
+    /// `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
+        let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        if kept_views()
+            && let Some((at, kept)) = victory_gpu::title_section_view(slice.section.0 as usize, offset, len)
+        {
+            return commit(at, len).then_some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
+                len,
+                kept: Some(kept),
+            });
+        }
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
@@ -625,7 +651,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, kept: None };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -640,6 +666,9 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.kept.is_some() {
+            return;
+        }
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
     }
@@ -886,7 +915,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     mapped_us(6, called);
     mapped(2, 1);
     mapped(4, (len / PAGE) as u64);
-    let ok = map_alias_pages(&mut physical, to, from, len);
+    let ok = map_alias_run(&mut physical, to, from, len);
     drop(physical);
     mapped_us(3, called);
     mapped_line();
@@ -906,58 +935,56 @@ fn shown_page(physical: &Physical, at: usize) -> Option<Slice> {
         })
 }
 
-fn map_alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
-    if same_pages() && len % PAGE == 0 {
-        // Only the stretches that are to show something else.
-        let mut at = 0;
-        while at < len {
-            let same = |physical: &Physical, k: usize| {
-                let there = shown_page(physical, to + k);
-                let asked = if from == 0 { None } else { shown_page(physical, from + k) };
-                match (there, asked) {
-                    (None, None) => from == 0,
-                    (Some(a), Some(b)) => a.key(0) == b.key(0),
-                    _ => false,
-                }
-            };
-            if same(physical, at) {
-                mapped(5, 1);
-                at += PAGE;
-                continue;
-            }
-            let mut end = at + PAGE;
-            while end < len && !same(physical, end) {
-                end += PAGE;
-            }
-            if !map_alias_run(physical, to + at, if from == 0 { 0 } else { from + at }, end - at) {
-                if from != 0 {
-                    // As below: nothing is shown from the failed page on.
-                    let _changing = victory_gpu::title_memory_remapping();
-                    unmap(physical, to + end, len - end);
-                }
-                return false;
-            }
-            at = end;
-        }
-        return true;
-    }
-    map_alias_run(physical, to, from, len)
-}
-
 fn map_alias_run(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let Some(slice) = shown_page(physical, from + k) else {
+    if from == 0 {
+        return true;
+    }
+    // Where the two ranges overlap, a page looked up may be one just mapped:
+    // page by page then.
+    let overlap = from < to + len && to < from + len;
+    let runs = map_runs() && !overlap;
+    let pages = len.div_ceil(PAGE);
+    let mut i = 0;
+    while i < pages {
+        let Some(first) = shown_page(physical, from + i * PAGE) else {
             return false;
         };
-        if !map(physical, to + k, PAGE, slice) {
-            return false;
+        let mut run = 1;
+        while runs
+            && i + run < pages
+            && shown_page(physical, from + (i + run) * PAGE)
+                .is_some_and(|s| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + run)
+        {
+            run += 1;
         }
+        let at = to + i * PAGE;
+        if run > 1 {
+            // `unmap` leaves a placeholder for each view it took away: made
+            // one, or the run is mapped page by page below.
+            // SAFETY: acts only on placeholders; fails harmlessly unless
+            // `[at, at + run pages)` is exactly whole adjacent placeholders.
+            unsafe {
+                VirtualFree(at as *mut c_void, run * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+            if map_quiet(physical, at, run * PAGE, first.clone()) {
+                mapped(5, run as u64);
+                i += run;
+                continue;
+            }
+        }
+        for k in 0..run {
+            let slice = Slice {
+                index: first.index + k,
+                section: first.section.clone(),
+            };
+            if !map(physical, at + k * PAGE, PAGE, slice) {
+                return false;
+            }
+        }
+        i += run;
     }
     true
 }
@@ -965,8 +992,18 @@ fn map_alias_run(physical: &mut Physical, to: usize, from: usize, len: usize) ->
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_logged(physical, base, len, slice, true)
+}
+
+/// [`map`] without the warning when the host refuses (a caller with
+/// another way to map).
+fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_logged(physical, base, len, slice, false)
+}
+
+fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, log: bool) -> bool {
     let started = std::time::Instant::now();
-    let done = map_view(physical, base, len, slice);
+    let done = map_view(physical, base, len, slice, log);
     mapped(12, 1);
     mapped(13, (len / PAGE) as u64);
     mapped_us(14, started);
@@ -990,7 +1027,7 @@ fn map_rest(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
     }
 }
 
-fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log: bool) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1013,6 +1050,9 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> b
         )
     };
     if view.Value as usize != base {
+        if !log {
+            return false;
+        }
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,

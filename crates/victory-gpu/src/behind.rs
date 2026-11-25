@@ -80,6 +80,23 @@ fn mirror(section: usize, bytes: u64) {
         .insert(section, Arc::new(Mirror { base: at.Value as usize, bytes }));
 }
 
+/// The view of a whole section, held.
+pub struct TitleSectionView {
+    _mirror: Arc<Mirror>,
+}
+
+/// Where bytes `[offset, offset + len)` of `section` are in the view of ours
+/// that shows all of it, if there is one, and what keeps that view. Nothing
+/// is noted of what is written there.
+pub fn title_section_view(section: usize, offset: u64, len: usize) -> Option<(usize, TitleSectionView)> {
+    let mirrors = MIRRORS.read().unwrap_or_else(PoisonError::into_inner);
+    let mirror = mirrors.as_ref()?.get(&section)?;
+    if offset.checked_add(len as u64)? > mirror.bytes {
+        return None;
+    }
+    Some((mirror.base + offset as usize, TitleSectionView { _mirror: mirror.clone() }))
+}
+
 /// A write of ours into title memory `[at, at + len)`; its blocks are noted
 /// written when it is dropped.
 pub(crate) struct Behind {
