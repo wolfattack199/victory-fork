@@ -322,6 +322,111 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+/// A console wave64 group on 32-lane host waves that do not exchange (the DPP move stays
+/// within each half, so the waves run as halves): a constant lane mask in `v_cndmask_b32`
+/// has no console lane numbers to pick its bits by there (both host waves would take the
+/// low dword), so it is refused.
+#[test]
+fn a_constant_select_mask_on_host_halves_is_refused() {
+    let inline = [
+        0x7E02_02FAu32,
+        0xFF01_1100, // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+        0xD501_0002,
+        0x0205_0301, // v_cndmask_b32 v2, v1, 1, 1
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    let held = [
+        0xBE80_03FFu32,
+        0x5555_5555, // s_mov_b32 s0, 0x55555555
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0x7E02_02FA,
+        0xFF01_1100, // v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf
+        0xD501_0002,
+        0x0001_0301, // v_cndmask_b32 v2, v1, 1, s[0:1]
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    for words in [&inline[..], &held[..]] {
+        a_constant_select_mask_on_host_halves(words);
+    }
+}
+
+fn a_constant_select_mask_on_host_halves(words: &[u32]) {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let was = super::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    super::TEST_HOST_WAVE.set(was);
+    let Err(e) = lowered else {
+        panic!("a constant select mask on host halves was translated");
+    };
+    assert!(e.to_string().contains("a constant lane mask in a half-wave"), "{e}");
+}
+
+#[test]
+fn v_cndmask_accepts_uniform_and_constant_masks() {
+    // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+    // (resolved in `Structured::other` or directly as constants).
+    let words = [
+        0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+        0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+        0xD501_0001,
+        0x0001_0280, // v_cndmask_b32 v1, 0, 1, s0
+        0xD501_0002,
+        0x0201_0301, // v_cndmask_b32 v2, v1, 1, 0
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    // (TGID_X_EN: s0 starts as the group id.)
+    lowers(&words, 0x8081).unwrap();
+    // Another constant names lanes: refused where host lanes are not the console's,
+    // inline or in a register.
+    let mut inline = words;
+    inline[5] = 0x0205_0301; // v_cndmask_b32 v2, v1, 1, 1
+    let e = lowers(&inline, 0x8081).unwrap_err();
+    assert!(e.to_string().contains("a constant lane mask"), "{e}");
+    let held = [
+        0xBE80_03FFu32,
+        0x5555_5555, // s_mov_b32 s0, 0x55555555
+        0xD501_0002,
+        0x0001_0280, // v_cndmask_b32 v2, 0, 1, s0
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        S_ENDPGM,
+    ];
+    let e = lowers(&held, 0x8001).unwrap_err();
+    assert!(e.to_string().contains("a constant lane mask"), "{e}");
+}
+
 fn perm_features(selector: u32) -> u64 {
     // Synthetic compute shader:
     // v0 is the thread ID and can supply a dynamic selector.

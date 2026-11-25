@@ -924,11 +924,30 @@ fn lane_constant_masks(st: &Structured) -> bool {
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
     });
-    let mut work: Vec<Bool> = st.guards.iter().flatten().flatten().copied().chain(whens).collect();
+    let work: Vec<Bool> = st
+        .guards
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .chain(whens)
+        .collect();
     // Through lane-mask joins too: an edge that brings a number or a constant lane set needs
     // the lane's own bit of it.
-    // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed; such
-    // a program still stops with "a constant lane mask" or "an opaque lane mask".
+    // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed. A carry
+    // in from one stops with "a carry-in from an untracked mask"; a `v_cndmask_b32` with "a
+    // constant lane mask" or "an opaque lane mask" ("a constant lane mask in a half-wave" on
+    // host waves that do not exchange), except a compute `v_cndmask_b32` on an opaque mask
+    // outside `Structured::masks`: with nothing else turning console lanes on, it takes the
+    // number's bit by the host lane (`cross_lane`'s debug assertion). Follow those selects here
+    // if a program needs them.
+    mask_reaches(st, work, |a| {
+        matches!(a, Atom::Opaque(_) | Atom::Constant(_))
+    })
+}
+
+/// Whether an atom `hit` takes is in the support of a mask in `work`, through lane-mask joins.
+fn mask_reaches(st: &Structured, mut work: Vec<Bool>, hit: impl Fn(Atom) -> bool) -> bool {
     let (mut seen, mut joins) = (HashSet::new(), HashSet::new());
     while let Some(g) = work.pop() {
         if !seen.insert(g) {
@@ -936,7 +955,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                a if hit(a) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -7513,16 +7532,50 @@ impl<'a> Lower<'a> {
                     _ => None,
                 };
                 const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
-                    Some(m) => self.boolean(m, c)?,
+                // Host waves of 32 that do not exchange have no console lane numbers to pick
+                // a constant's bits by (`lane_bit` would read the low dword in both).
+                let halves = self.local || self.exchange.is_none() && self.halves.is_some();
+                let st = &self.x.st;
+                // Masks from EXEC and VALU results, then the others structurisation resolved
+                // (uniform selects, constants); one held as a number, through joins too, takes
+                // its bits below, from the pair read here.
+                let known = mask.and_then(|m| {
+                    st.masks.get(&m).copied().or_else(|| {
+                        st.other.get(&m).copied().filter(|&b| {
+                            !mask_reaches(st, vec![b], |a| {
+                                matches!(a, Atom::Opaque(_))
+                                    || halves && matches!(a, Atom::Constant(_))
+                            })
+                        })
+                    })
+                });
+                let cond = match (known, v.src.get(2)) {
+                    (Some(m), _) => self.boolean(m, c)?,
+                    // An inline integer mask: no lane, every lane, or this lane's bit of it.
+                    (None, Some(&Operand::Const(k @ 128..=208))) => {
+                        let x = crate::resource::inline(k).ok_or(UNTRACKED)?;
+                        if x == 0 {
+                            self.s.m.bool(false)
+                        } else if x == u32::MAX {
+                            self.s.m.bool(true)
+                        } else if halves {
+                            return Err("a constant lane mask in a half-wave");
+                        } else if self.console_lanes {
+                            let lo = self.s.m.i32(x);
+                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                            self.lane_bit(c, lo, Some(hi))
+                        } else {
+                            return Err("a constant lane mask");
+                        }
+                    }
                     // A mask the code holds as a number (a constant bit
                     // pattern: every other lane, every other pair...):
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
-                    None if self.mask_data == MaskData::Console => {
+                    (None, _) if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
                         // console lane numbers to pick the bits by.
-                        if self.local {
+                        if halves {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
@@ -7541,7 +7594,7 @@ impl<'a> Lower<'a> {
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
                     }
-                    None => return Err(UNTRACKED),
+                    (None, _) => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
