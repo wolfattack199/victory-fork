@@ -21,13 +21,51 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
 | Checks | 537 tests pass, 0 fail, 10 are ignored; three lints that failed the strict check are fixed |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
-| Graphics in the game | the opening cutscene draws: characters, cars, streets, lights and title cards. Shadowed areas, faces among them, are too dark or black in some shots, and some objects appear late |
-| Frame rate in the world | **not playable: 1.5 to 4 fps in most of the opening cutscene**, 6 to 7 fps at best, single frames of 1 to 4 seconds |
+| Graphics in the game | the opening cutscene draws: characters, cars, streets, lights and title cards. Skin and shadowed areas come out black in some shots, objects are low-detail, and some appear late |
+| Frame rate in the world | **not playable: 3.0 fps median** in the better of the last two runs, 6.9 fps at best |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
-### Progress report, 2026-11-25
+### Working on right now
+
+- **Frame rate.** The file-loading threads make a slow Windows memory call for
+  every read, and the game's own threads make the same call when they swap
+  memory pages. The fix is designed but none of it is written yet: about 10 %.
+- **Black characters.** While working out the numbers below I found that 12 to
+  13 % of draws never reach the card. I'm finding out which shaders those are.
+  The cause is not confirmed yet: about 25 %.
+
+### Progress by area
+
+| Area | Done | Based on |
+|---|---|---|
+| Frame rate towards 30 fps, typical scene | 10 % | measured: 3.0 fps median in the better of the last two runs |
+| Frame rate towards 30 fps, best moments | 23 % | measured: 6.9 fps |
+| Draws that reach the card | 88 % | measured in the last two runs |
+| Shaders ready before you see them | 99 % | measured: 2,632 loaded from the cache, 18 made new |
+| Shaders that translate or are accepted | about 99 % | 12 still fail, and those can black out large areas |
+| Picture looks right | about 50 % | estimate: black skin and shadows, low-detail objects |
+| Textures and cars loading in time | about 40 % | estimate: 13,764 textures were still waiting at the end of the last run |
+| Audio | about 80 % | estimate: the stall that cut it out is gone, but I haven't listened for it yet |
+| Keyboard and mouse | 100 % | done |
+| NVIDIA driver | 100 % | the game already draws through it |
+| DLSS | 0 % | no code for it yet |
+| Ray tracing | 0 % | off, so nothing is lit by it |
+
+The measured rows come from the opening cutscene on the PC below. The
+estimates are my own judgment, not measurements.
+
+### Corrections
+
+- **The last run was slower.** Typical frames took 430 ms, against 329 ms
+  before, and none of it reached 5 fps. It covered less of the cutscene, so the
+  comparison is rough, but my two new switches didn't help.
+- **The "3D lighting texture" was probably wrong.** I misread the log. It's
+  most likely an ordinary 2D texture, and I haven't shown that it causes the
+  black.
+
+### Progress report, 2026-11-25 (earlier)
 
 Measured on one PC: Windows 11, Ryzen 5 5500 (6 cores), RTX 5060 Ti 16 GB,
 32 GB RAM, in the opening cutscene, with the Series X and Series S profiles.
@@ -44,7 +82,7 @@ it comes here when its tests have passed.
 | Input | controller only | keyboard and mouse too, with a key file |
 | Intro and loading screens | 30 fps | 30 fps, with dips while the world loads (not a milestone) |
 
-What holds the frame rate down now, as measured:
+What held the frame rate down at that point, as measured:
 
 - The processor is at 100 %. NVIDIA's driver compiles shaders again in the
   background on four threads, about 3.5 of the 6 cores for minutes; the same
@@ -57,9 +95,9 @@ What holds the frame rate down now, as measured:
   card take 60 to 230 ms a frame each way. The card itself is busy for 20 to
   200 ms of a frame.
 
-Known problems: sound cuts out while the processor is saturated; three puddle
-pixel shaders and several compute programs do not translate or are refused;
-ray tracing is off, so nothing is lit by it.
+Known problems: skin and shadowed areas can be black; 12 shaders still fail to
+translate or are refused, among them three puddle pixel shaders and several
+compute programs; ray tracing is off, so nothing is lit by it.
 
 No footage is published here: this repository holds nothing from the game
 ([docs/asset-policy.md](docs/asset-policy.md)).
