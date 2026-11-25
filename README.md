@@ -46,6 +46,156 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
+**Update, the same night: the first room now renders right on the test
+machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
+frames a second): the picture work has caught up, the frame rate has not.
+What did it, on top of the list below:
+- Descriptor records the title copies into its heap as plain bytes are
+  mirrored before every submission (pull request #305 by Flyander, after
+  upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
+  that no call had announced; their host slots were empty or stale.
+- A buffer view that does not start on an element of its buffer's host
+  copy gets a copy of its own bytes instead of being refused (after
+  upstream 86a5ed6): 3 to 6 such views a frame.
+- Room on the card is kept for the render targets and buffer copies a
+  world makes in its first frame: 98 buffer copies are made (945 MB) where
+  the runs before made 1, and the processor no longer compares 550 to
+  710 MB a frame looking for shader writes (25 MB now).
+- Levels on demand ran on the card for the first time
+  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default; with the fixes of
+  pull request #747 by AscilCH): 3.1 GB of the card not allocated for
+  texture levels the title does not hold, no device loss.
+- Guarded blocks under storage writes are opened by default; 14 more
+  shader programs translate; a program is translated with first-half
+  interpolation pairs only if it was refused for one (with that on for
+  every program, 8,551 working pixel programs came out changed).
+- Frame rate, first cuts on the processor side: the descriptor sync uses a
+  cheap fingerprint and leaves draw-table slots to their draws (the pass
+  over the heap went from 70-220 ms a frame to about 3), and memory the
+  guards already hold is not asked of the write watch (pull request #670
+  by Jonirulah). Card copies' pieces can come down inside their own
+  flights (pull request #648 by Jonirulah, `VICTORY_CARD_FETCH_INFLIGHT=1`,
+  off by default: the copy-back thread's wait went from 181 ms a frame to
+  0 here, but the card got busier, so no gain is claimed yet). The frame is
+  still 250 to 380 ms: the card is the limit now, most of it the
+  per-record clamp before each of some 6,700 indirect draws a frame.
+- Pull request #220 (cheaper indirect draws) is IN this tree now, its
+  windows off by default (`VICTORY_INDIRECT_WINDOW=1`). History, so nobody
+  repeats it: with windows on it lost the device three times here. Its own
+  checker (`VICTORY_INDIRECT_WINDOW_CHECK=1`) then showed one list drawing
+  90 records of 2^24 vertices from a window, where the per-draw path lets
+  eight through; a record of 2^23 vertices an instance or more now runs
+  empty. Since that fix: eight runs with windows on, seven without a
+  device loss and one that lost the device 44 s into the world (cause not
+  found; see the driver watch below). One earlier loss after the fix had
+  the in-flight fetch (#648) on as well; do not combine the two. The
+  in-flight fetch itself measured slower here in two runs and stays off.
+- Frame rate, second night (an RTX 4070; the first room went from about
+  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  defaults are unchanged and give about 4.5-5):
+  - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
+    thread of the layer, not by the title's render thread, which a
+    profile showed inside the submit path for 257 of 292 ms a frame.
+  - `VICTORY_QUEUE2=1`: fetches of what shaders wrote go to a copy queue
+    (brought back, with the fix for a piece fetched beside a later
+    flight); the copy-back thread's wait fell from about 125 to 7 ms a
+    frame.
+  - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
+    the title remaps memory; the loading phase had 5 readings over a
+    second where it had 18.
+  - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
+    under flights' shader writes are joined over small gaps (NOT exact:
+    read the comment at `merge_gap` before using it).
+  - On by default: fills of upload memory and read-only buffer copies no
+    longer wait for flights and are checked against what the flights then
+    wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
+    so far); up to 512 idle host lists and texture staging buffers are
+    reused instead of made and freed every frame.
+  - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
+    the layer; it is how the above was found.
+- Frame rate, third session: measuring first (same RTX 4070, first room).
+  - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
+    frame's length, and for the usual frame and each long one what it was
+    made of (the render thread's time in the present call, the submit
+    thread's work, copies, copy-back, recording, texture work, faults,
+    disk). A card meter (`VICTORY_CARD_METER`) adds the card's time by
+    kind of list from a timestamp at each list's start and end.
+  - What they showed, windows off: a usual frame of 136 ms; the title's
+    render thread waits 77 ms of it in the present call for the submit
+    thread, which works 118 ms (copies of title memory 41, copy-back 40);
+    the card is 85-98 % busy, of about 130 ms a frame 16 ms in our lists
+    that bring card copies up to date, 10 ms in our compare lists and 102
+    ms in the title's own lists with the per-record clamp. Frame time is
+    linear in draws (about 32 microseconds a draw all-in): the title draws
+    about twice as much on some frames, which are the long ones.
+  - The regular dips of earlier test runs were the test harness: a saved
+    frame (`VICTORY_CAPTURE_WORLD`, every 8th world frame) is read back
+    and written as a PNG inside the present, 235 ms each.
+    `VICTORY_CAPTURE_WORLD_EVERY=64` for runs that measure speed.
+  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments. A
+    CORRECTION: the first figures given here (6.0 against 8.9 frames a
+    second) compared two runs that stood in different scenes during the
+    measured window (about 4,300 against 1,550 draws a frame) and are
+    withdrawn. Compared at equal draws, by a line fitted to each run's
+    frame times against its draws per frame: windows off 145 ms at 4,500
+    draws and 271 ms at 10,000; windows on with `VICTORY_COPY_PLAIN=1`
+    124 ms and 211 ms. On screen: 7-8 frames a second in the first rooms,
+    10-12 in their lighter views.
+  - A driver watch (on by default; `VICTORY_DRIVER_WATCH=0` off): the
+    layer subscribes to the system's event log and logs every entry of a
+    display driver as it is recorded; the first one turns draw windows
+    off for the rest of the run. Every device loss here had such entries
+    2.7 to 55 seconds before the device was removed, and no run without
+    them lost its device.
+  - A copy between two title textures that share one host texture is no
+    longer recorded (the host does not allow a texture copied onto
+    itself): 402 of them in a five-minute run.
+  - The list of shader-visible heaps is a reader-writer lock (recording
+    threads waited 48 ms a frame, summed, behind the heap sync); the heap
+    sync looks at a changed page's records under one lock, fingerprint
+    first; guarded view memory is left out of a submission's write-watch
+    askings ahead (after triippywhale).
+  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
+    process, with a handler that falls back to the kernel's copy on a
+    missing page. Its first form also took the layer's one-byte "is this
+    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+    reads under 256 bytes now stay with the kernel and a source that
+    faulted is left alone for two seconds (4 to 9 faults a frame). The
+    submit thread's kernel time fell from 44 to 20 ms a frame; the
+    picture is the same.
+  - The layer's submit and copy-back threads ask for the fast cores of a
+    hybrid processor (`VICTORY_FAST_CORES=0`: not): the submit thread was
+    found on a slow core in 6 % of its looks, now in none of 21,059.
+    `VICTORY_DISK_CORES=slow` (off, not measured) asks the slow cores for
+    the DirectStorage workers, which are as many as the logical
+    processors and free to run anywhere.
+  - Behind switches, built and unit-tested, not yet shown to pay:
+    `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
+    `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
+    `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
+    no gain while the card is the limit).
+  - Tried and refused: `VICTORY_BVH_HOLD=1` holds back the 64 programs
+    that walk ray-tracing structures nothing has built; the picture loses
+    its indirect light with it, so it stays off.
+  - The process opts out of the system's efficiency mode
+    (`VICTORY_EFFICIENCY_MODE=1` leaves it); on a hybrid processor the
+    frame log found the title's render and recording threads on fast
+    cores in every look of a run, and the layer's submit thread on a slow
+    core in 6 % of its looks.
+  Still open: the per-record clamp is most of the card's time, and the
+  copies between the PC's memory and the card's are most of the submit
+  thread's; the cause of the one device loss with windows is not known.
+  A first play session past the first rooms reached the open world and
+  lost the device there with no driver entry (reason "device removed"):
+  the card had no room for new textures from the opening cutscene on
+  (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
+  for lack of room; 44,613 textures let go and made again in 13 minutes).
+  Cause of that removal not known either.
+- Known and counted, not fixed yet: an indirect compute pass asks for
+  about 77,500 thread groups in x where one dispatch runs 65,535 (the
+  rest is cut off).
+
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken
   through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title

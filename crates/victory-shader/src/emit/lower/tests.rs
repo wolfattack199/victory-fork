@@ -9,7 +9,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 #[test]
 fn packed_pixel_inputs_find_their_second_row() {
     use super::super::container::SigElement;
-    use super::half_input_partners;
+    use super::packing::half_input_partners;
     use crate::native::{PsInput, Usage};
     let entry = |row, row2, pack2| PsInput {
         usage: Usage::Generic,

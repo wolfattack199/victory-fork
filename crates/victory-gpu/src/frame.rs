@@ -154,6 +154,12 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(wait);
         S_OK
     };
+    #[cfg(windows)]
+    {
+        let us = wait.min(limit).as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
