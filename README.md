@@ -10,6 +10,131 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## This copy (wolfattack199/victory-fork)
+
+This is a copy of [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+(at `0b0074e`) with the changes below on top. Its aim is correct shaders and
+graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
+
+| | State (2026-11-25) |
+|---|---|
+| Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
+| Checks | 822 tests pass, 2 fail, 15 are ignored. Of the two, one fails about every second run in the repository this is a copy of as well, the other failed here before this update |
+| In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
+| Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there |
+| Frame rate in the world | **not playable: 2.7 fps median**, 2.0 fps with all textures loading (the picture above); 10.9 fps at best, in one shot with little in it |
+
+The results in "Status of this fork" further down are fxceless's, measured on
+another PC.
+
+### Working on right now
+
+- **Frame rate.** The fixes designed before are written and in, and one more
+  was found while testing them (below). They made a frame's preparation
+  cheaper, but the whole frame is not faster yet: the PC has under 1 GB of
+  its 32 GB of memory free while the game runs, and Windows reads up to
+  190 MB a second back from the disk. Next: less memory used by the layer.
+- **Black faces after a cut.** Their textures arrive late. Next: the textures
+  of what is on screen go first.
+
+### Progress by area
+
+| Area | Done | Change | Based on |
+|---|---|---|---|
+| Frame rate towards 30 fps, typical scene | 9 % | 10 % before | measured: 2.7 fps median, 367 ms a frame. With all textures loading 2.0 fps (7 %) |
+| Frame rate towards 30 fps, best moments | 36 % | 23 % before | measured: 10.9 fps in one shot of 391 draws; 5.2 fps (17 %) where more is drawn |
+| Draws that reach the card | 90 % | 88 % before | measured. What is dropped includes the ray tracing builder's programs, which are off on purpose |
+| Shaders that translate | 99 % | more are counted now | measured: 25,679 of 25,889 in the game's whole library |
+| Shaders the game asks for that fail | 4 left | 12 before | measured: 3 refused by the driver, 1 not translated |
+| Shaders ready before you see them | 74 % | 99 % before | measured: 1,967 pipelines loaded, 695 made new in the first run after the translator changed; they are kept from then on |
+| Picture looks right | about 70 % | 50 % before | estimate: people and streets look right; late textures, no real shadows or reflections |
+| Textures and cars loading in time | about 55 % | 40 % before | estimate. The card no longer runs full: 8.5 GB in use, 13.4 GB before. Black faces after a cut are still there |
+| Audio | about 90 % | 80 % before | measured: no gap of 0.4 s or more in 88 s of two recordings; a whole session is not checked |
+| Keyboard and mouse | 100 % | | done |
+| NVIDIA driver | 100 % | | the game draws through it |
+| DLSS | 0 % | | no code for it yet |
+| Ray tracing | 0 % | | off. A constant stands in for its indirect light (`VICTORY_AMBIENT`); that is not ray tracing |
+
+The measured rows come from the opening cutscene on the PC below. The
+estimates are my own judgment, not measurements.
+
+### New in this update
+
+- **Why people were black: found, and mostly fixed.** Two causes. The game's
+  bounce light is ray traced and does not run here, so what the sun or a lamp
+  does not reach was black: `VICTORY_AMBIENT=0.2` puts a constant in its place
+  (by UwUCammie after Belobug; 0.6 is far too bright at night). And the card
+  was full, so thousands of textures were never loaded and read as black:
+  `VICTORY_LEVELS_ON_DEMAND=1` takes card memory only for the texture sizes
+  the game really holds, about 3.5 GB less here.
+- **One wait too many, fixed.** Four seconds into the world one read of 2 KB
+  overlapped a shader's write, and the layer then waited for the card before
+  all such reads, 13 times a frame, 70 to 146 ms. Now only reads of the 64 KB
+  where that was seen wait: 1 to 1.5 times a frame, about 34 ms.
+- Merged: fxceless/victory-fork up to `0b0074e`; the 16-bit buffer fix for
+  faces and mouths (tippythetaidum); two ray tracing fixes (sedzz, Pablo
+  Barros); the 32-lane shader fixes and page runs of #823 (Felix2180).
+- File writes go through views that are kept; the layer's frame threads run
+  at the priority of the game's threads that wait for them.
+- A change of a test file no longer throws away every translated shader.
+
+Switches used for the numbers above, besides the defaults:
+`VICTORY_AMBIENT=0.2 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1
+VICTORY_QUEUE2=1 VICTORY_COPY_PLAIN=1 VICTORY_WRITE_BEHIND=1
+VICTORY_TEXTURE_NO_WAIT=1 VICTORY_TEXTURE_SPILL=0 VICTORY_RELAY=2
+VICTORY_WIDE_REFRESH=1 VICTORY_WIDE_MERGE=1 VICTORY_WIDE_TEXTURES=1
+VICTORY_LAND_ASIDE=1 VICTORY_JOIN_COPIES=1 VICTORY_CARD_REHASH_RUNS=1
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`.
+
+### Corrections
+
+- **The new code did not raise the typical frame rate.** 367 ms a frame
+  against 329 ms in the best run before it. Preparing a frame went from 153 to
+  98 ms, and other waits took its place. The shots compared are not exactly
+  the same ones.
+- **With every texture loading it is slower, not faster:** 498 ms a frame.
+  Before, textures that were never loaded cost nothing.
+- "12 shaders still fail" counted what the game had asked for. Of the whole
+  library 210 do not translate; most are never asked for.
+- Earlier: the two switches tried before this update did not help, and the
+  "3D lighting texture" was most likely an ordinary 2D one.
+
+### Progress report, 2026-11-25 (earlier)
+
+Measured on one PC: Windows 11, Ryzen 5 5500 (6 cores), RTX 5060 Ti 16 GB,
+32 GB RAM, in the opening cutscene, with the Series X and Series S profiles.
+The code for what follows is on `main` with this update.
+
+| What | Before | Now |
+|---|---|---|
+| Picture in cutscenes | black, with sound (only the first of the planes the title presents was shown) | drawn |
+| World frames | 2 to 5 s each; texture refreshes waited up to 4.1 of 4.2 s for title memory to hold still | 0.25 to 0.7 s in most shots, 0.14 s at best |
+| Making a texture on the card | 0.5 to 1.2 ms each | about 0.05 ms (placed in shared blocks of card memory) |
+| Upload buffer for a texture | 1.4 ms each | about 0.2 ms (used again) |
+| Upscaler shaders | several did not translate | translate |
+| Input | controller only | keyboard and mouse too, with a key file |
+| Intro and loading screens | 30 fps | 30 fps, with dips while the world loads (not a milestone) |
+
+What held the frame rate down at that point, as measured:
+
+- The processor is at 100 %. NVIDIA's driver compiles shaders again in the
+  background on four threads, about 3.5 of the 6 cores for minutes; the same
+  scene went from 1-2 fps to 6.9 fps when that stopped by itself. Windows only
+  lets a program switch it off in Developer Mode, so those threads are being
+  kept on one core instead.
+- Memory: the game takes 20 to 27 GB on top of everything else that runs, the
+  system is at its commit limit, and the page file grows by 14 to 35 GB.
+- Card memory is full (16 GB in use), and copies between title memory and the
+  card take 60 to 230 ms a frame each way. The card itself is busy for 20 to
+  200 ms of a frame.
+
+Known problems: skin can be black for a moment after a cut; four shaders the
+game asks for still fail, all compute programs; ray tracing is off, so there
+are no ray traced shadows, reflections or bounce light.
+
+No footage is published here: this repository holds nothing from the game
+([docs/asset-policy.md](docs/asset-policy.md)).
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

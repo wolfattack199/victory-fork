@@ -6,6 +6,15 @@
 
 use std::path::{Path, PathBuf};
 
+/// A file of tests (`tests.rs`, `*_tests.rs`): each is a module under
+/// `cfg(test)`, no part of the translator, so a change of one must not cost
+/// the cache of every translated shader.
+fn tests_only(file: &Path) -> bool {
+    file.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s == "tests" || s.ends_with("_tests"))
+}
+
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -14,7 +23,7 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
+        } else if p.extension().is_some_and(|x| x == "rs") && !tests_only(&p) {
             out.push(p);
         }
     }
