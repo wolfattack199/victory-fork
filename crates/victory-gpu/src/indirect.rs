@@ -8,12 +8,13 @@
 //! shader with its root signature inside), leaving the title's argument and
 //! count buffers untouched.
 //!
-//! When a count buffer is given, threads at or past `min(max, count)` return
-//! immediately without charging the list's budget or reading uninitialized
+//! When a count buffer is given, records at or past `min(max, count)` are
+//! skipped without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
-//! groups counted as 64 threads, mesh groups as 128): active records past it
-//! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! groups counted as 64 threads, mesh groups as 128), charged in record
+//! order: from the first active record that does not fit on, records run
+//! empty, so a list of thousands of garbage records cannot run for seconds
+//! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -49,86 +50,111 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// A record past the budget (no cost reaches it).
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+// One group walks the records in tiles of 64: every lane clamps its own
+// record, then the first lane charges the tile's records in order. No
+// other group shares the budget: a shared add wraps once enough records
+// are rejected, and a compare-exchange retries more the more records fit.
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint lane : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
-    uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint2 asked = src_args.Load2(src_at);
-        if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
-            asked = uint2(0, 0);
-        }
-        uint count = min(asked.x, 1u << 24);
-        uint instances = min(asked.y, (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
-            g = uint3(0, 0, 0);
-        }
-        // Diagnostics, in the budget buffer's next words: the largest
-        // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
+    // Tiles up to the count: every lane loads it from the same address of a
+    // buffer we only read, so every lane reaches the barriers.
+    for (uint tile = 0; tile < eff_count / 64 + min(eff_count % 64, 1u); tile++) {
+        uint record = tile * 64 + lane;
+        bool active = record < eff_count;
+        uint src_at = args_offset + record * stride;
+        uint dst_at = record * stride;
+        uint cost = 0;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        if (active) {
+            if (kind <= 1) {
+                // Draws: vertex or index count, then instances.
+                uint2 asked = src_args.Load2(src_at);
+                if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+                    asked = uint2(0, 0);
+                }
+                uint count = min(asked.x, 1u << 24);
+                uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                draw_counts = uint2(count, instances);
+            } else if (kind == 2) {
+                uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+                // x * y fits 32 bits; the whole count may not.
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64u;
+                groups = g;
+            } else {
+                // Mesh dispatches: the console's are one-dimensional.
+                uint3 g = src_args.Load3(src_at);
+                // Ahead of its draw, a record over the most a dispatch runs is a
+                // slot the title has not filled (the title leaves all
+                // ones there): empty, and not counted below either.
+                if (ahead && g.x > 65535u) {
+                    g = uint3(0, 0, 0);
+                }
+                // Diagnostics, in the budget buffer's next words: the largest
+                // group count a mesh record asked for, and the groups asked in all.
+                uint was;
+                budget.InterlockedMax(4, g.x, was);
+                budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+                g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+                cost = g.x * g.y * g.z * 128u;
+                groups = g;
+            }
         }
-        over = before >= BUDGET || BUDGET - before < cost;
+        costs[lane] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            for (uint i = 0; i < min(64u, eff_count - tile * 64); i++) {
+                if (costs[i] > left) {
+                    // The first record that does not fit takes what is
+                    // left, so those after it run empty too.
+                    costs[i] = PAST;
+                    left = 0;
+                } else {
+                    left -= costs[i];
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        bool over = costs[lane] == PAST;
+        if (active) {
+            if (kind <= 1) {
+                if (over) {
+                    draw_counts = uint2(0, 0);
+                }
+                dst_args.Store2(dst_at, draw_counts);
+                for (uint off = 8; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            } else {
+                if (over) {
+                    groups = uint3(0, 0, 0);
+                }
+                dst_args.Store3(dst_at, groups);
+                for (uint off = 12; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            }
+        }
     }
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
-    } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
     }
 }
 "#;
@@ -349,7 +375,8 @@ fn record_clamp_as(
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // waits for every earlier shader write out (the state changes stay), so
+    // back-to-back clamps may overlap and under-charge the budget.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
@@ -384,7 +411,8 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One group walks every record.
+            l.Dispatch(1, 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -1150,6 +1178,116 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Clamps `records` records of `kind`, filled by repeating `words`,
+    /// `calls` times in one list on the software adapter: each record's first
+    /// word after (zero when it runs empty). The scratch record after them
+    /// must stay unwritten. `None` without the software adapter.
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        let mut warp = WarpHarness::new()?;
+        // Words in a record of `kind`.
+        let per = match kind {
+            0 => 4,
+            1 => 5,
+            _ => 3,
+        };
+        let spec = (kind, per as u32 * 4, records);
+        let all = per * (records as usize + 1);
+        let bytes = all as u64 * 4;
+        let (src, src_ptr, _) = warp.shared_buffer(bytes);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback, readback_ptr, _) = warp.shared_buffer(bytes);
+        let dst = warp.default_uav(bytes);
+        // SAFETY: our mapped buffers, written before the list runs; an open
+        // list and live buffers.
+        unsafe {
+            for at in 0..all {
+                src_ptr
+                    .cast::<u32>()
+                    .add(at)
+                    .write_volatile(words[at % words.len()]);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for _ in 0..calls {
+                let (c, l) = (&warp.clamp, &warp.list);
+                assert!(record_clamp(c, l, &dst, budget_gpu, (&src, 0), None, spec));
+                done_on(&warp.list, &dst);
+            }
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback, 0, &dst, 0, bytes);
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; our mapped buffer.
+        unsafe {
+            let out = readback_ptr.cast::<u32>();
+            assert!((all - per..all).all(|at| out.add(at).read_volatile() == 0));
+            Some(
+                (0..records as usize)
+                    .map(|i| out.add(i * per).read_volatile())
+                    .collect(),
+            )
+        }
+    }
+
+    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
+    /// vertex instances each once clamped) two run, where a wrapping add
+    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    #[test]
+    fn rejected_records_do_not_wrap_the_budget() {
+        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+            return; // no software adapter here
+        };
+        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+    }
+
+    /// The budget goes to the first records, in order: of 200 draws of
+    /// 3 * 2^18 vertices the first 170 run (it ends inside the third tile);
+    /// small records that all fit all run.
+    #[test]
+    fn the_budget_goes_to_the_first_records() {
+        let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
+            return; // no software adapter here
+        };
+        assert!(draws[..170].iter().all(|&count| count != 0));
+        assert!(draws[170..].iter().all(|&count| count == 0));
+        let small = clamped(0, &[1], 1 << 16, 1).unwrap();
+        assert!(small.iter().all(|&count| count == 1));
+    }
+
+    /// A record that does not fit ends the budget: after two draws of
+    /// 3 * 2^24 vertex instances a third takes what is left, and the small
+    /// ones after it run empty.
+    #[test]
+    fn a_record_that_does_not_fit_ends_the_budget() {
+        let mut words = [1 << 24, 3, 0, 0].repeat(3);
+        words.extend([3, 1, 0, 0].repeat(6));
+        let Some(draws) = clamped(0, &words, 8, 1) else {
+            return; // no software adapter here
+        };
+        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
+        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+    }
+
+    /// The budget is the list's: a second clamp of the same records finds it
+    /// spent, and they all run empty.
+    #[test]
+    fn a_spent_budget_stays_spent() {
+        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
+            return; // no software adapter here
+        };
+        assert!(twice.iter().all(|&count| count == 0));
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
