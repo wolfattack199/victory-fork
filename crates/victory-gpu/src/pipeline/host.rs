@@ -219,6 +219,11 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// The blend as the host pipeline is made with it ([`Self::host_blend`]):
+    /// named by the title's, a pipeline stored before the integer slots
+    /// lost their blend (or with `VICTORY_FIX_INTBLEND` the other way) kept
+    /// its name, and the library would refuse it at every run (its
+    /// description no longer matches) without storing the new one.
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -238,7 +243,7 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -1405,6 +1410,19 @@ mod blend_tests {
         let b = g.host_blend();
         assert!(b.RenderTarget[0].BlendEnable.as_bool());
         assert!(!b.RenderTarget[1].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn the_name_follows_the_host_blend() {
+        // The integer slot blends in one description and not in the other:
+        // the host makes the same pipeline of both, under the same name.
+        let a = state(&[28, 62], true, &[true, true]);
+        let b = state(&[28, 62], true, &[true, false]);
+        assert_ne!(format!("{:?}", a.blend), format!("{:?}", b.blend));
+        assert_eq!(a.describe(), b.describe());
+        // A float slot's blend still tells pipelines apart.
+        let c = state(&[28, 62], true, &[false, false]);
+        assert_ne!(a.describe(), c.describe());
     }
 
     #[test]
