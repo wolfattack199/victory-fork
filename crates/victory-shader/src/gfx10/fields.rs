@@ -589,7 +589,10 @@ impl Instruction {
                     }
                 }
                 let vdst = w0 & 0xFF;
-                v.dst = Some(if compare {
+                v.dst = Some(if name.starts_with("v_cmpx") {
+                    // CMPX ignores VDST and writes EXEC only.
+                    scalar(EXEC, lanes)
+                } else if compare {
                     scalar(vdst as u8, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)

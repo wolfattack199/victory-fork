@@ -353,6 +353,23 @@ mod tests {
     }
 
     #[test]
+    fn vop3_cmpx_writes_exec() {
+        let code = bytes(&[0xD411_0005, 0x0001_E501, S_ENDPGM]);
+        let inst = &decode(&code).unwrap()[0];
+        assert_eq!(inst.name(), Some("v_cmpx_lt_f32"));
+        let Fields::Valu(v) = inst.fields(false) else {
+            panic!("not a VALU");
+        };
+        assert_eq!(
+            v.dst,
+            Some(Operand::Scalar {
+                code: 126,
+                dwords: 1
+            })
+        );
+    }
+
+    #[test]
     fn tables_are_sorted() {
         for t in [
             opcodes::SOP2,
