@@ -466,6 +466,25 @@ fn short_hold() -> bool {
     SWITCH.on()
 }
 
+/// Every how many frames a texture in guarded memory that the guards found
+/// unwritten is read and hashed all the same, the textures taking turns by
+/// address (`VICTORY_TEXTURE_HASH_EVERY`: 8 by default, as before; 0 never).
+///
+/// Why a switch: the hash was there for writes through another view of the
+/// same pages, which the guards did not see then. They do now (a guard
+/// makes every view of its pages read-only, `crate::watch::protect`), yet
+/// the turns still read an eighth of the guarded textures in use every
+/// frame. Texture refreshes cost about 0.25 ms per MB read, however much
+/// of it changed (runs c67-c71: 173 to 636 MB read a frame in the opening
+/// cutscene). What the turns find changed is counted with
+/// `VICTORY_TEXTURE_CHANGES=1`.
+fn hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+    })
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -1091,8 +1110,8 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        const HASH_EVERY: u64 = 8;
-        let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+        let every = hash_every();
+        let turn = every != 0 && crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(every);
         let counts = crate::watch::changes_all(start, start + size);
         if !turn && last.quiet == Some(counts) {
             // Nothing happened to its blocks since they were found clean.
@@ -1104,14 +1123,17 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            changes::why(0);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                if !self.held_unchanged(last, read) {
+                let changed = !self.held_unchanged(last, read);
+                if changed {
                     changes::from(0);
                     self.detile(read);
                 }
+                changes::read(size, changed);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1125,9 +1147,12 @@ impl Staging {
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // texture's address, so the textures take turns ([`hash_every`]:
+        // the guards see such writes by now, and the turns can be made
+        // rarer or left out).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut why = 4;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written, held)) = waited(1, || crate::watch::writes_held(start, start + size, true))
         {
@@ -1137,7 +1162,9 @@ impl Staging {
             if unwritten && !turn {
                 return 0;
             }
+            why = if unwritten { 3 } else { 2 };
         }
+        changes::why(why);
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1180,6 +1207,7 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
+            changes::why(1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1205,7 +1233,7 @@ impl Staging {
             if changed {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
-            let _ = changed;
+            changes::read(size, changed);
             return size;
         }
         if short_hold() {
@@ -1218,6 +1246,7 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    changes::read(size, false);
                     return size;
                 }
                 last.hash = Some(hash);
@@ -1227,6 +1256,7 @@ impl Staging {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                changes::read(size, true);
                 size
             });
         }
@@ -1236,6 +1266,7 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    changes::read(size, false);
                     return size;
                 }
                 last.hash = Some(hash);
@@ -1245,6 +1276,7 @@ impl Staging {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                changes::read(size, true);
                 size
             });
         }
@@ -1255,6 +1287,7 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            changes::read(size, false);
             return size;
         }
         last.hash = Some(hash);
@@ -1264,6 +1297,7 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        changes::read(size, true);
         size
     }
 
@@ -1281,6 +1315,7 @@ impl Staging {
                 return false;
             }
             let hash = blake3::hash(read);
+            changes::read(size, last.hash != Some(hash));
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 if !self.held_unchanged(last, read) {
@@ -1872,6 +1907,42 @@ mod changes {
         }
     }
 
+    /// Why a refresh reads a texture's memory ([`why`]): 0 the write-watch
+    /// found pages written, 1 partly mapped (read again), 2 guarded and
+    /// written to, 3 guarded and unwritten (hashed in its turn,
+    /// `super::hash_every`), 4 not guarded.
+    const WHYS: [&str; 5] =
+        ["written pages found", "partly mapped", "guarded, written to", "guarded, unwritten (hashed in its turn)", "not guarded"];
+
+    thread_local! {
+        static WHY: std::cell::Cell<u8> = const { std::cell::Cell::new(4) };
+    }
+
+    /// Bytes read by refreshes, by why, and of them the bytes found changed.
+    static READS: [[std::sync::atomic::AtomicU64; 2]; 5] =
+        [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+
+    /// Why the refresh that follows on this thread reads the memory.
+    pub(super) fn why(why: u8) {
+        if on() {
+            WHY.with(|w| w.set(why));
+        }
+    }
+
+    /// A refresh read `bytes` of a texture's memory and found them
+    /// `changed` (or not).
+    pub(super) fn read(bytes: usize, changed: bool) {
+        if !on() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let why = usize::from(WHY.with(std::cell::Cell::get)).min(4);
+        READS[why][0].fetch_add(bytes as u64, Relaxed);
+        if changed {
+            READS[why][1].fetch_add(bytes as u64, Relaxed);
+        }
+    }
+
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGES").is_some_and(|v| v == "1"))
@@ -1953,12 +2024,25 @@ mod changes {
                 now - SKIPPED[i].swap(now, std::sync::atomic::Ordering::Relaxed)
             })
             .collect();
+        let reads: Vec<String> = READS
+            .iter()
+            .zip(WHYS)
+            .map(|(r, name)| {
+                let [all, changed] = [0, 1].map(|i| r[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+                (all, changed, name)
+            })
+            .filter(|&(all, ..)| all > 0)
+            .map(|(all, changed, name)| {
+                format!("{name} {:.1} MB ({:.1} of it changed)", mb(all) / frames as f64, mb(changed) / frames as f64)
+            })
+            .collect();
         tracing::info!(
-            "texture memory detiled per frame (VICTORY_TEXTURE_CHANGES): {:.1} MB in {} textures over {frames} frames; passed over, the held levels and their bytes as before (VICTORY_TEXTURE_HELD_ONLY): {:.1} a frame, {:.1} MB; by path, per frame: {}; most, over those frames: {}; by shape, over those frames: {}",
+            "texture memory detiled per frame (VICTORY_TEXTURE_CHANGES): {:.1} MB in {} textures over {frames} frames; passed over, the held levels and their bytes as before (VICTORY_TEXTURE_HELD_ONLY): {:.1} a frame, {:.1} MB; read, per frame, by why: {}; by path, per frame: {}; most, over those frames: {}; by shape, over those frames: {}",
             mb(total) / frames as f64,
             all.len(),
             skipped[0] as f64 / frames as f64,
             mb(skipped[1]) / frames as f64,
+            reads.join(", "),
             paths.join(", "),
             top.join("; "),
             by_shape.join("; ")

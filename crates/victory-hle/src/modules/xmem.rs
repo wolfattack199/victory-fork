@@ -379,10 +379,30 @@ const PAGE: usize = 64 << 10;
 /// A section for physical pages: its handle, whether it was made committed
 /// whole, its pages, and a bit per page set once a view showed it (renderer
 /// port 1's [`arrange`] moves only pages never shown, whose bytes are still
-/// zeros and which the title cannot tell apart).
-struct Section(HANDLE, bool, usize, Box<[AtomicU64]>);
+/// zeros and which the title cannot tell apart), and a bit per page set once
+/// a view of it was committed ([`commit_once`]).
+struct Section(HANDLE, bool, usize, Box<[AtomicU64]>, Box<[AtomicU64]>);
 
 impl Section {
+    fn new(handle: HANDLE, committed: bool, n: usize) -> Section {
+        let bits = || (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        Section(handle, committed, n, bits(), bits())
+    }
+
+    /// Pages `[index, index + n)` were committed through a view: a reserved
+    /// section's pages stay committed, for every view, until it is closed.
+    fn committed(&self, index: usize, n: usize) {
+        for i in index..(index + n).min(self.2) {
+            self.4[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
+        }
+    }
+
+    /// Whether pages `[index, index + n)` were all committed through a view
+    /// before.
+    fn all_committed(&self, index: usize, n: usize) -> bool {
+        index + n <= self.2 && (index..index + n).all(|i| self.4[i / 64].load(Ordering::Acquire) >> (i % 64) & 1 == 1)
+    }
+
     /// Pages `[index, index + n)` are shown by a view from now on.
     fn shown(&self, index: usize, n: usize) {
         for i in index..(index + n).min(self.2) {
@@ -472,6 +492,32 @@ fn mapped(i: usize, n: u64) {
     MAPPED[i].fetch_add(n, Ordering::Relaxed);
 }
 
+/// Where a view's mapping goes, since the last log line, call by call:
+/// placeholder splits (calls, microseconds), section views mapped, commits
+/// made, commits passed over ([`commit_once`]; calls only), the GPU side's
+/// notices when a view is mapped, its notices when one is unmapped, and the
+/// table of what each page shows (both ways).
+static CALLS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+
+/// One call of kind `k` ([`CALLS`]) that began at `since`.
+fn call_us(k: usize, since: std::time::Instant) {
+    CALLS[2 * k].fetch_add(1, Ordering::Relaxed);
+    CALLS[2 * k + 1].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Whether a view of a reserved section commits only pages no view of it
+/// committed before (`VICTORY_COMMIT_ONCE=1`; off by default).
+///
+/// Every view mapped was committed whole (`VirtualAlloc` with `MEM_COMMIT`
+/// over it), though a reserved section's pages, once committed through one
+/// view, stay committed for all of them: one system call a view more, in
+/// the title's remapping, where a view costs 15 to 170 microseconds.
+fn commit_once() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_COMMIT_ONCE").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
 fn mapped_us(i: usize, since: std::time::Instant) {
     mapped(i, since.elapsed().as_micros() as u64);
 }
@@ -509,6 +555,29 @@ fn mapped_line() {
         per[12],
         per[13],
         per[14] / 1e3
+    );
+    let calls: [f64; 14] = std::array::from_fn(|i| CALLS[i].swap(0, Ordering::Relaxed) as f64 / seconds);
+    let each = |k: usize| if calls[2 * k] > 0.0 { calls[2 * k + 1] / calls[2 * k] } else { 0.0 };
+    tracing::info!(
+        "title memory mapped anew, by call, per second: {:.0} placeholder splits in {:.1} ms ({:.0} us each); {:.0} views \
+         mapped in {:.1} ms ({:.0} us each); {:.0} commits in {:.1} ms ({:.0} us each), {:.0} passed over \
+         (VICTORY_COMMIT_ONCE); the GPU side's notices: {:.0} at a map in {:.1} ms, {:.0} at an unmap in {:.1} ms; \
+         the table of what pages show: {:.1} ms",
+        calls[0],
+        calls[1] / 1e3,
+        each(0),
+        calls[2],
+        calls[3] / 1e3,
+        each(1),
+        calls[4],
+        calls[5] / 1e3,
+        each(2),
+        calls[6],
+        calls[8],
+        calls[9] / 1e3,
+        calls[10],
+        calls[11] / 1e3,
+        calls[13] / 1e3,
     );
 }
 
@@ -679,7 +748,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
-    let section = Arc::new(Section(handle, committed, n, (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()));
+    let section = Arc::new(Section::new(handle, committed, n));
     let first = {
         let mut physical = physical();
         let first = physical.next_page;
@@ -744,7 +813,7 @@ impl View {
         if kept_views()
             && let Some((at, kept)) = victory_gpu::title_section_view(slice.section.0 as usize, offset, len)
         {
-            return commit(&slice.section, at, len).then_some(View {
+            return commit(&slice.section, slice.index, at, len).then_some(View {
                 at: MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
                 len,
                 kept: Some(kept),
@@ -766,7 +835,7 @@ impl View {
             return None;
         }
         let view = View { at, len, kept: None };
-        commit(&slice.section, at.Value as usize, len).then_some(view)
+        commit(&slice.section, slice.index, at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1253,12 +1322,18 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log:
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
-    let view = unsafe {
+    let started = std::time::Instant::now();
+    unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+        )
+    };
+    call_us(0, started);
+    let started = std::time::Instant::now();
+    // SAFETY: as above.
+    let view = unsafe {
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -1271,6 +1346,7 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log:
             0,
         )
     };
+    call_us(1, started);
     if view.Value as usize != base {
         if !log {
             return false;
@@ -1283,33 +1359,48 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log:
         );
         return false;
     }
-    if !commit(&slice.section, base, len) {
+    if !commit(&slice.section, slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    let started = std::time::Instant::now();
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    call_us(4, started);
+    let started = std::time::Instant::now();
     {
         let mut shown = shown();
         for k in 0..len.div_ceil(PAGE) {
             shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
         }
     }
+    call_us(6, started);
     physical.views.insert(base, (len, slice));
     true
 }
 
 /// Commits the section pages a view of `section` shows (once per page,
-/// whichever view).
-fn commit(section: &Section, base: usize, len: usize) -> bool {
+/// whichever view; with [`commit_once`] only if a page of them was never
+/// committed through a view). `index` is the view's first page in the
+/// section.
+fn commit(section: &Section, index: usize, base: usize, len: usize) -> bool {
     if section.1 {
         return true; // committed whole when made
     }
+    let pages = len.div_ceil(PAGE);
+    if commit_once() && section.all_committed(index, pages) {
+        CALLS[6].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let started = std::time::Instant::now();
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    let done = !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
+    call_us(2, started);
+    if done {
+        section.committed(index, pages);
         return true;
     }
     commit_refused(len, "physical pages", std::io::Error::last_os_error());
@@ -1413,6 +1504,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let started = std::time::Instant::now();
         {
             let mut shown = shown();
             for k in 0..size.div_ceil(PAGE) {
@@ -1425,7 +1517,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        call_us(6, started);
+        let started = std::time::Instant::now();
         victory_gpu::title_memory_remapped(at, size);
+        call_us(5, started);
         let started = std::time::Instant::now();
         if at < base || at + size > end {
             mapped(10, 1);
@@ -1680,6 +1775,61 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    /// `VICTORY_COMMIT_ONCE`: a section knows which of its pages a view
+    /// committed, page by page, across the 64-page words of its bits.
+    #[test]
+    fn a_section_knows_which_pages_were_committed() {
+        let section = Section::new(std::ptr::null_mut(), false, 130);
+        assert!(!section.all_committed(60, 8));
+        section.committed(60, 4);
+        assert!(section.all_committed(60, 4));
+        assert!(!section.all_committed(60, 8), "pages 64 to 67, in the next word, were not");
+        section.committed(64, 4);
+        assert!(section.all_committed(60, 8));
+        assert!(section.all_committed(63, 2));
+        assert!(!section.all_committed(59, 2));
+        section.committed(128, 9);
+        assert!(section.all_committed(128, 2), "pages past the section are not noted");
+        assert!(!section.all_committed(129, 2), "nor asked about");
+        assert!(section.fresh(60), "committing is not showing");
+    }
+
+    /// What `VICTORY_COMMIT_ONCE` rests on: a reserved section's page
+    /// committed through one view is committed in every view of it, a view
+    /// mapped later included, with no commit through that view.
+    #[test]
+    fn a_page_committed_through_one_view_is_committed_in_another() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, VirtualQuery};
+        // SAFETY: a section of our own, its views ours until unmapped.
+        unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, (4 * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * PAGE);
+            assert!(!a.Value.is_null());
+            let query = |at: *const c_void| {
+                let mut info = MEMORY_BASIC_INFORMATION::default();
+                assert_ne!(VirtualQuery(at, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+                info.State
+            };
+            assert_eq!(query(a.Value.wrapping_byte_add(PAGE)), MEM_RESERVE, "reserved before any commit");
+            assert!(!VirtualAlloc(a.Value.wrapping_byte_add(PAGE), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            a.Value.wrapping_byte_add(PAGE + 8).cast::<u32>().write(0x5eed);
+            // A second view, mapped after the commit, and one mapped where
+            // only the part past the page is asked for.
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * PAGE);
+            assert!(!b.Value.is_null());
+            assert_eq!(query(b.Value.wrapping_byte_add(PAGE)), MEM_COMMIT);
+            assert_eq!(b.Value.wrapping_byte_add(PAGE + 8).cast::<u32>().read(), 0x5eed);
+            b.Value.wrapping_byte_add(PAGE + 12).cast::<u32>().write(0xbeef);
+            assert_eq!(a.Value.wrapping_byte_add(PAGE + 12).cast::<u32>().read(), 0xbeef);
+            assert_eq!(query(b.Value.wrapping_byte_add(2 * PAGE)), MEM_RESERVE, "the next page, never committed");
+            assert_ne!(UnmapViewOfFile(a), 0);
+            assert_ne!(UnmapViewOfFile(b), 0);
+            CloseHandle(section);
+        }
     }
 
     /// Renderer port 1: pages mapped into a 32-bit reservation piece by

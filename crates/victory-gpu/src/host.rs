@@ -8562,17 +8562,6 @@ impl Batch {
     }
 }
 
-/// Copies title memory at submission. The ranges were checked against their
-/// resources when recorded, but the title may since have unmapped pages of
-/// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped takes nothing from its
-/// first unmapped page on.
-///
-/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
-/// unmapped page of the source, or of the destination it writes, instead of
-/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
-/// title's big pools (it walks the page tables to the region's end), which
-/// made copies run at 100-200 MB/s.
 /// Draws a frame as the window's caption last said them (0 before the
 /// first), for the runtime's `VICTORY_AUTO_START`.
 static RECENT_DRAWS: AtomicU32 = AtomicU32::new(0);
@@ -8583,6 +8572,19 @@ pub fn recent_draws() -> u32 {
     RECENT_DRAWS.load(Ordering::Relaxed)
 }
 
+/// Copies title memory at submission. The ranges were checked against their
+/// resources when recorded, but the title may since have unmapped pages of
+/// them (tiled memory, page mappings), which read as zeros here; a title
+/// destination (`title_dst`) that is not all mapped takes nothing from its
+/// first unmapped page on.
+///
+/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
+/// unmapped page of the source, or of the destination it writes, instead of
+/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
+/// title's big pools (it walks the page tables to the region's end), which
+/// made copies run at 100-200 MB/s. With `VICTORY_READ_BEHIND=1` a source
+/// wholly in views of sections is read through our own views of them
+/// ([`crate::behind::read_on`]).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -8611,8 +8613,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
+    // Into host memory, through our views of the title's sections, if all
+    // of the source is in views of them ([`crate::behind::read_on`]).
+    if !title_dst && read_through(src, dst, len) {
+        return;
+    }
     // Behind the guards, if all of it can be ([`crate::behind`]).
-    if title_dst && let Some(behind) = crate::behind::of(dst as usize, len) {
+    if title_dst && crate::behind::on() && let Some(behind) = crate::behind::of(dst as usize, len) {
         let whole = behind
             .within(dst as usize, len)
             .all(|(title, ours, n)| read(src.wrapping_add(title - dst as usize), ours as *mut u8, n));
@@ -8709,9 +8716,30 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    // In place first, if asked for (`crate::plaincopy`): the destination is
+    // Through our views first, if asked for ([`crate::behind::read_on`]);
+    // then in place, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+    read_through(src, dst.as_mut_ptr(), dst.len())
+        || crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len())
+        || read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// With `VICTORY_READ_BEHIND=1`: reads `[src, src + len)` into host memory
+/// `dst` through our views of the title's sections, if all of it is in views
+/// of sections with a view of ours ([`crate::behind::through`]); false (and
+/// nothing read) otherwise.
+fn read_through(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if !crate::behind::read_on() || len == 0 {
+        return false;
+    }
+    let Some(through) = crate::behind::through(src as usize, len) else {
+        crate::behind::counted(false, len);
+        return false;
+    };
+    // SAFETY: the callers' destination is `len` bytes of host memory.
+    unsafe { through.copy_into(src as usize, dst) };
+    crate::behind::counted(true, len);
+    true
 }
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
@@ -8756,7 +8784,8 @@ fn direct_writes() -> bool {
 /// behind its guards, held until the writes are done; `None` if there is
 /// none, and the guards have been opened.
 pub(crate) fn title_write(at: usize, len: usize) -> Option<crate::behind::Behind> {
-    let behind = crate::behind::of(at, len);
+    // (Our views may be there for reads alone: `VICTORY_READ_BEHIND`.)
+    let behind = crate::behind::on().then(|| crate::behind::of(at, len)).flatten();
     if behind.is_none() {
         crate::watch::writing(at, len);
     }
@@ -9164,6 +9193,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::port::log(frames);
+        crate::behind::log(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);

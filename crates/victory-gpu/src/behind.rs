@@ -44,10 +44,61 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_BEHIND").is_some_and(|v| v == "1"))
 }
 
+/// Whether reads of title memory that lies wholly in views of sections go
+/// through our views of those sections ([`through`]; `VICTORY_READ_BEHIND=1`,
+/// off by default; it makes the views of ours as `VICTORY_WRITE_BEHIND` does,
+/// and writes stay as that switch has them).
+///
+/// Why: the title maps and unmaps its pages some thousands of times a
+/// second, and a page at an address it has just mapped is in no page table
+/// yet. Our copies of its memory read it at the title's addresses, so every
+/// 4 KiB of them faulted it in again (55,000 to 60,000 faults in a frame of
+/// the opening cutscene, run c75; about what we read a frame), and in the
+/// kernel's copy too. Each such fault takes the process's working-set lock,
+/// which every map and unmap the title asks for takes as well: in some runs
+/// those cost the title 80 to 190 microseconds each in its own process
+/// while the same calls in another process at the same moment took 5 to 9
+/// (run c78; `mapbench.py`), and up to 3.7 s of a 4 s frame. Our views stay
+/// mapped: a page faults in there once.
+pub(crate) fn read_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BEHIND").is_some_and(|v| v == "1"))
+}
+
+/// Reads since the last line: through our views (calls, bytes), and those
+/// not wholly in views of sections with a view of ours (calls, bytes).
+static READS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A read of title memory `[at, at + len)` asked for: `through` it went
+/// through our views, else as before.
+pub(crate) fn counted(through: bool, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = if through { 0 } else { 2 };
+    READS[k].fetch_add(1, Relaxed);
+    READS[k + 1].fetch_add(len as u64, Relaxed);
+}
+
+/// For the frame-rate line.
+pub(crate) fn log(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !read_on() {
+        return;
+    }
+    let s: [f64; 4] = std::array::from_fn(|i| READS[i].swap(0, Relaxed) as f64 / frames.max(1e-9));
+    tracing::info!(
+        "reads of title memory per frame (VICTORY_READ_BEHIND): {:.0} through views of ours ({:.1} MB), {:.0} at the \
+         title's addresses as before ({:.1} MB)",
+        s[0],
+        s[1] / 1048576.0,
+        s[2],
+        s[3] / 1048576.0
+    );
+}
+
 /// The runtime made a section of `bytes`.
 pub(crate) fn section_made(section: usize, bytes: u64) {
     section_gone(section);
-    if on() {
+    if on() || read_on() {
         mirror(section, bytes);
     }
 }
@@ -134,6 +185,46 @@ impl Drop for Behind {
 /// A write into title memory `[at, at + len)` behind its guards; `None` if
 /// part of it is not a view of a section with a view of ours.
 pub(crate) fn of(at: usize, len: usize) -> Option<Behind> {
+    let (pieces, held) = pieces(at, len)?;
+    Some(Behind { at, len, pieces, _held: held })
+}
+
+/// A read of title memory through our views of its sections
+/// ([`read_on`]): where each piece is, and what keeps those views mapped.
+pub(crate) struct Through {
+    /// Title address, ours, bytes; in address order.
+    pieces: Vec<(usize, usize, usize)>,
+    _held: Vec<Arc<Mirror>>,
+}
+
+impl Through {
+    /// Copies the read's bytes into `dst`, which has room for them all.
+    ///
+    /// # Safety
+    /// `dst` is `len` bytes of host memory, the caller's to write, for the
+    /// `[at, at + len)` this was made for.
+    pub(crate) unsafe fn copy_into(&self, at: usize, dst: *mut u8) {
+        for &(title, ours, n) in &self.pieces {
+            // SAFETY: a section's page a view of the title's shows was
+            // committed when that view was mapped (`xmem`'s `map`), for
+            // every view of the section, ours included, and stays committed
+            // while the section lives; `_held` keeps our view mapped.
+            unsafe { std::ptr::copy_nonoverlapping(ours as *const u8, dst.add(title - at), n) };
+        }
+    }
+}
+
+/// A read of title memory `[at, at + len)` through our views; `None` if part
+/// of it is not a view of a section with a view of ours.
+pub(crate) fn through(at: usize, len: usize) -> Option<Through> {
+    let (pieces, held) = pieces(at, len)?;
+    Some(Through { pieces, _held: held })
+}
+
+/// `[at, at + len)` in pieces of views of sections with a view of ours:
+/// title address, ours, bytes, in address order, and those views held.
+#[allow(clippy::type_complexity)]
+fn pieces(at: usize, len: usize) -> Option<(Vec<(usize, usize, usize)>, Vec<Arc<Mirror>>)> {
     if len == 0 {
         return None;
     }
@@ -155,7 +246,7 @@ pub(crate) fn of(at: usize, len: usize) -> Option<Behind> {
             _ => pieces.push((title, ours, n)),
         }
     }
-    Some(Behind { at, len, pieces, _held: held })
+    Some((pieces, held))
 }
 
 #[cfg(test)]
@@ -235,6 +326,34 @@ mod tests {
         // SAFETY: committed; the write faults into the guards' handler.
         unsafe { ((one + 3 * K64) as *mut u8).write_volatile(7) };
         assert_eq!(fresh(one, asked), [3]);
+        drop_views(section, &[one, two], bytes);
+    }
+
+    /// `VICTORY_READ_BEHIND`: a read through our view gives the bytes the
+    /// title's views show, across the views of two sections' pages, and is
+    /// refused where a piece is no view of a section with a view of ours.
+    #[test]
+    fn a_read_through_our_view_gives_what_the_title_sees() {
+        let bytes = 3 * K64;
+        let (section, one, two) = two_views(3);
+        // SAFETY: committed views.
+        unsafe {
+            for k in 0..bytes {
+                ((one + k) as *mut u8).write((k % 253) as u8);
+            }
+        }
+        assert!(through(one, K64).is_none(), "no view of ours yet");
+        mirror(section, bytes as u64);
+        let (at, len) = (two + K64 - 300, K64 + 600);
+        let read = through(at, len).expect("views of a section with a view of ours");
+        let mut got = vec![0u8; len];
+        // SAFETY: `got` holds `len` bytes.
+        unsafe { read.copy_into(at, got.as_mut_ptr()) };
+        let want: Vec<u8> = (K64 - 300..2 * K64 + 300).map(|k| (k % 253) as u8).collect();
+        assert!(got == want);
+        let own = [0u8; 64];
+        assert!(through(own.as_ptr() as usize, own.len()).is_none());
+        drop(read);
         drop_views(section, &[one, two], bytes);
     }
 
