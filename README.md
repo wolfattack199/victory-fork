@@ -19,24 +19,24 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 857 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others (one of them, `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset`, failed in one of two whole runs here and passed alone three times and in two runs of its crate) |
+| Checks | 859 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate here). In one of two whole runs the graphics crate's test program stopped on an access violation while that test and others were under way; 14 runs of that program after it had none. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` failed in most runs today, also on the commit before this one: it took for granted which group of 64 records the card runs first, and now accepts either |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
-| Frame rate in the opening cutscene | **about 3.5 fps** (2026-11-26; about 2.0 before), the average of five runs of the same length (2.9 to 4.0). Still far from 30 |
+| Frame rate in the opening cutscene | **about 4.2 fps** (2026-11-26, later: 4.63 and 3.85 in two runs of the same length), about 3.5 in the five runs before (2.9 to 4.0), about 2.0 before that. Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
 ### Working on right now
 
-- **Frame rate in the opening cutscene: 30 fps is the aim.** Since the change
-  below, our submitting thread is what the title waits for most: its render
-  thread stands 44 % of its time in the present call until that thread has
-  sent what came before, and the submitting thread is at work about two thirds
-  of the time (some 250-290 ms a frame: hashing, copies of title memory,
-  descriptor tables, textures), with no one part much larger than the others.
-  The card is busy only 25-36 % of the frame.
+- **Frame rate in the opening cutscene: 30 fps is the aim.** A frame now has
+  two halves of about 200 ms each (run c24, 2.5 ms steps): first one thread of
+  the title's works alone while ours stand idle, then our submitting thread and
+  its four helpers work (hashing, copies of title memory, descriptor tables,
+  textures) while the title waits for them. What that title thread does is
+  next. The card is busy about a third of the frame. A fence the title signals
+  is set 120-290 ms after its call (run c22, `VICTORY_PACE=1`).
 - **Frame rate: 20 fps first, then 30.** Our submitting thread works about
   100 ms a frame: some 65 preparing (the descriptor tables the title wrote,
   refreshing copies of its buffers) and 35 sending about 125 MB up to the card,
@@ -58,14 +58,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 17 % | about 10 % before | measured: 2.86, 3.97, 3.72, 3.45 and 3.75 fps in five runs with staging buffers cut from blocks (c13-c16, c19), 3.55 on average; 1.58 to 2.61 in seven runs before it and 1.71 with it turned off (c17), about 2.0. Each run: the game started, the last 60 s of its first 75 s in the world measured |
-| Frame rate in the opening cutscene, towards 30 fps | about 12 % | about 7 % before | the same runs |
+| Frame rate in the opening cutscene, towards 20 fps | about 21 % | about 17 % before | measured: 4.63 and 3.85 fps in two runs with remaps holding only what they change (c23, c24), 4.24 on average; 2.86 to 3.97 in five runs before it (c13-c16, c19), 3.55 on average; about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run (2,100 and 3,200 draws a frame in c23 and c24), so two runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 30 fps | about 14 % | about 12 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 88 % | 66 % before, at more draws | measured: 54 to 60 ms busy in the last four runs (35 to 49 the title's lists, 9 to 19 sending and hashing, 2 comparing) at 2,900 to 3,900 draws a frame; it was 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 12 of the last 12 short runs | 4 of 6 before | measured: the 75 s cutscene runs c8 to c19 ran to the end and closed cleanly |
+| Runs that finish | 17 of the last 17 short runs | 4 of 6 before | measured: the 75 s cutscene runs c8 to c24 ran to the end and closed cleanly. Longest frame 1.3 and 1.7 s in c23 and c24; 2.4 to 10.8 s in runs before |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -77,7 +77,44 @@ The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed, unless they name the cutscene. The estimates
 are my own judgment, not measurements.
 
-### New in this update (2026-11-26): the opening cutscene at about 3.5 fps
+### New in this update (2026-11-26, later): remaps hold only what they change
+
+| Runs (75 s each, the opening cutscene) | Lock while the title remaps its memory | fps |
+|---|---|---|
+| c13-c16, c19, c21 | all of title memory, as before | 2.86, 3.97, 3.72, 3.45, 3.75, 3.42 |
+| c23, c24 | only the addresses the remap changes | 4.63, 3.85 |
+
+- **What the frames waited for.** Texture refreshes read title memory in place
+  and hold a lock while they do, so that the runtime does not take pages away
+  under the read; the runtime takes the same lock alone while it maps or
+  unmaps physical pages, some hundreds of times a frame here. It was one lock
+  for all of memory: every remap, wherever it was, held up every texture read,
+  and every read every remap. In run c22 refreshes on all threads waited up to
+  7.4 s a frame (added over the threads) "for title memory to hold still", and
+  in one frame of 5.2 s 1,327 remaps held the lock for 3.9 s. Earlier runs
+  had 0 to 880 ms a frame of it.
+- **Now a remap holds only the addresses it changes** (`crates/victory-gpu/src/watch.rs`,
+  `crates/victory-hle/src/modules/xmem.rs`; `VICTORY_MAP_RANGES=0` brings the
+  one lock back), and a read only the texture or buffer it reads. A remap
+  holds the whole of every view it meets, since the runtime takes a whole view
+  away to change one page of it and maps the rest again. A read waits for a
+  remap that is waiting where it reads, so that reads cannot keep a remap out
+  for ever. In c23 and c24 the refreshes waited 0.0 ms in every line of the
+  log, and remaps 0.0 ms for readers.
+- **Tests.** A new test has a thread read the first and last page of a view of
+  three pages while the middle page is mapped again, 400 times on fresh views.
+  With the remap holding only the page it changes, the test process stopped
+  on an access violation in 3 of 3 runs; with the whole view held, it passed 3
+  of 3. Another test checks that reads and remaps wait for one another only
+  where their ranges meet.
+- **Fence timing** (`VICTORY_PACE=1`) says its line every ten seconds too, not
+  only every 256 frames (at 3.5 fps that was longer than a run). In c22 a
+  fence the title signals on its queue was set 120 to 290 ms after its call,
+  about 17 such signals a frame.
+- The remaps themselves still take time: 36 to 68 ms a second usually, and in
+  some seconds 600 ms or more (1,178 views unmapped in 614 ms in one).
+
+### The update before (staging buffers cut from blocks, about 3.5 fps)
 
 | Runs (75 s each, the opening cutscene) | Staging buffers | fps |
 |---|---|---|

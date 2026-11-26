@@ -300,17 +300,24 @@ pub(crate) mod pace {
         });
     }
 
-    /// Once a frame, on the thread that presents: a line every 256 frames.
+    /// Once a frame, on the thread that presents: a line every 256 frames,
+    /// or every ten seconds when frames are slow (at 3.5 a second, 256 of
+    /// them outlast a whole short run).
     pub(crate) fn frame() {
         if !on() {
             return;
         }
+        static LINE_WHEN: Mutex<Option<Instant>> = Mutex::new(None);
         RENDER.store(thread(), Ordering::Relaxed);
         let frame = crate::queue::presented();
         let last = LINE_AT.load(Ordering::Relaxed);
-        if frame < last + 256 {
+        let mut when = LINE_WHEN.lock().unwrap_or_else(|e| e.into_inner());
+        let since = when.get_or_insert_with(Instant::now).elapsed();
+        if frame < last + 256 && since.as_secs() < 10 {
             return;
         }
+        *when = Some(Instant::now());
+        drop(when);
         LINE_AT.store(frame, Ordering::Relaxed);
         let n: Vec<f64> = N.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
         let frames = (frame - last).max(1) as f64;

@@ -2140,7 +2140,7 @@ impl State {
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 // The runtime unmaps a whole view to change a page of it:
                 // what is not there while it does may be there again.
-                let still = crate::watch::title_memory_reading_now();
+                let still = crate::watch::title_memory_reading_now_at(address as usize, len as usize);
                 let mapped = part_of_pass(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 && still.is_none() {
                     HEAP_TEXTURES_UNSURE.fetch_add(1, Ordering::Relaxed);
@@ -3291,7 +3291,7 @@ impl State {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::title_memory_reading_at(from, n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

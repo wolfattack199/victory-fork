@@ -101,6 +101,7 @@ pub use behind::{TitleSectionView, title_section_view};
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_reading, title_memory_reading_at, title_memory_remapped, title_memory_remapping, title_memory_remapping_at,
+    title_memory_written,
     writing as kernel_will_write,
 };

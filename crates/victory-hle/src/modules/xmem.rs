@@ -881,8 +881,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    // into that gap (`victory_gpu::title_memory_remapping`). Only where
+    // the change reaches: reads of other textures go on meanwhile.
+    let (from, to) = touched(&physical, base, n * PAGE);
+    let _changing = victory_gpu::title_memory_remapping_at(from, to - from);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -990,7 +992,8 @@ fn shown_page(physical: &Physical, at: usize) -> Option<Slice> {
 
 fn map_alias_run(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let (from_at, to_at) = touched(physical, to, len);
+    let _changing = victory_gpu::title_memory_remapping_at(from_at, to_at - from_at);
     unmap(physical, to, len);
     if from == 0 {
         return true;
@@ -1191,6 +1194,30 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// The addresses whose mapping a change of `[base, base + len)` reaches:
+/// that range and the whole of every view it meets, which [`unmap`] takes
+/// away whole and maps again in part. Views do not overlap, so only the
+/// one holding `base` can begin before it and only the last one beginning
+/// inside can end after it.
+fn touched(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    if len == 0 {
+        return (base, base);
+    }
+    let mut lo = base;
+    let mut hi = end;
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        lo = at;
+        hi = hi.max(at + size);
+    }
+    if let Some((&at, &(size, _))) = physical.views.range(base + 1..end).next_back() {
+        hi = hi.max(at + size);
+    }
+    (lo, hi)
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1613,6 +1640,71 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// The same with the read holding its own page only, while the title
+    /// remaps another page of the same view: the change takes the whole view
+    /// away for a moment, so it must hold the whole view (`touched`). Each
+    /// round a fresh view of three pages (a view cut once stays in pieces),
+    /// the reader at its first and last page while its middle one is mapped
+    /// again.
+    #[test]
+    fn a_read_of_one_page_never_meets_the_gap_of_a_remap_of_another() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let views: Vec<usize> = (0..400)
+            .map(|_| {
+                let at = XMemVirtualAlloc(
+                    std::ptr::null_mut(),
+                    3 * PAGE,
+                    MEM_RESERVE | PAGES_64K,
+                    0,
+                    PAGE_READWRITE,
+                );
+                assert!(!at.is_null());
+                assert_eq!(XMemMapPhysicalPages(at, 3, pages.as_ptr()), at);
+                assert_eq!(physical().views.get(&(at as usize)).map(|v| v.0), Some(3 * PAGE), "one view");
+                at as usize
+            })
+            .collect();
+        // SAFETY: mapped read-write; every view shows the same pages.
+        unsafe {
+            (views[0] as *mut u8).write(1);
+            (views[0] as *mut u8).add(2 * PAGE).write(3);
+        }
+        let now = std::sync::Arc::new(AtomicUsize::new(views[0]));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (now, stop) = (now.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let base = now.load(Ordering::Relaxed);
+                    for (at, value) in [(base, 1u8), (base + 2 * PAGE, 3)] {
+                        let _reading = victory_gpu::title_memory_reading_at(at, 1);
+                        // SAFETY: the page is mapped whenever no change of
+                        // mapping that reaches it is under way.
+                        assert_eq!(unsafe { (at as *const u8).read_volatile() }, value);
+                        reads += 1;
+                    }
+                }
+                reads
+            })
+        };
+        for &at in &views {
+            now.store(at, Ordering::Relaxed);
+            std::thread::yield_now();
+            let middle = (at + PAGE) as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(middle, 1, &pages[1]), middle);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader never faulted") > 0);
+        for &at in &views {
+            assert_eq!(XMemMapPhysicalPages(at as *mut c_void, 3, std::ptr::null()), at as *mut c_void);
+        }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
