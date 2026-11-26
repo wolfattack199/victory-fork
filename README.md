@@ -19,11 +19,11 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 862 tests pass, 1 fails, 15 are ignored (2026-11-26, morning; the graphics crate has one test more since, 286 of 286 in most runs). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. Some tests of the graphics crate fail in some runs and not in others, a different one each time: in 14 runs of the crate this morning, 3 had a failure and one stopped without a result, as noted before (`memory_that_is_no_view_is_not_written_behind`, `warp_a_fetch_through_the_copy_queue_brings_what_the_direct_queue_brings`, and in a run without this morning's last change `waits_end_on_ticks_and_count_frames` with `written_pages_are_reported_to_every_asker`); each passes run again. They share tables of views and sections with tests running beside them, which is the likely cause; not mended yet. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before |
+| Checks | 862 tests pass, 1 fails, 15 are ignored (2026-11-26, morning; the graphics crate has one test more since, 286 of 286 in most runs). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. Some tests of the graphics crate fail in some runs and not in others, a different one each time: in 14 runs of the crate this morning, 3 had a failure and one stopped without a result, as noted before (`memory_that_is_no_view_is_not_written_behind`, `warp_a_fetch_through_the_copy_queue_brings_what_the_direct_queue_brings`, and in a run without this morning's last change `waits_end_on_ticks_and_count_frames` with `written_pages_are_reported_to_every_asker`); each passes run again. They share tables of views and sections with tests running beside them, which is the likely cause; not mended yet. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before. At midday only the runtime crate changed (the pool switch of the newest update): its 156 tests pass |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
-| Frame rate in the opening cutscene | **about 4.8 fps** (2026-11-26, night: ten runs of the same length, 3.43 to 5.58, 4.81 on average; in the 3.43 a fault, now mended, turned the faster texture answer off a minute in), about 4.0 in the three clean runs before (3.41 to 4.63; the "about 4.2" said here before was two of them), about 3.5 before that, about 2.0 before that. Still far from 30 |
+| Frame rate in the opening cutscene | **about 4.0 fps** (2026-11-26, midday: seven usual runs since the morning, 3.47 to 4.67, 3.96 on average). The code of the night before, built again and run the same way, gave 4.15 today (one run), so the lower figure most likely comes from the PC's state (memory, see the newest update), not from the morning's changes; that night's ten runs gave 4.81 on average. About 4.0 in the three clean runs before those, about 3.5 before that, about 2.0 before that. Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
@@ -51,7 +51,16 @@ another PC.
   card's memory (Windows charges that too), plus a 4 GB pool of the title's
   pages. With other programs open the PC's limit came within 0.5 GB in every
   run. 2.2 to 2.6 GB of the blocks textures are placed in stand empty, in
-  pieces, so no block can be given back.
+  pieces, so no block can be given back. Measured at midday (newest update):
+  of the game's memory actually in RAM in the cutscene, about 8.7 GB is our
+  own (2.8 GB of it host copies of windows of title memory) and about 5.7 GB
+  the title's; with the game closed, the other programs open held 43.8 of the
+  PC's 60.3 GB of commit and 13.5 GB of RAM.
+- **What the frame waits for.** In the long frames the title's render thread
+  stands in our present call for most of the frame (175 to 600 ms in run c64),
+  until our submitting thread has prepared the frame's ten submissions (100 to
+  190 ms preparing: copies of title memory, 44 to 64 ms and about 250 MB; the
+  copy-back, 34 to 71 ms). That thread's preparing is what to cut.
 - **Flicker** (ground going black and back): textures the title fills after
   writing their view are caught and uploaded again 1 to 7 frames late; whether
   that is the cause is not known yet.
@@ -63,14 +72,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 23 % | 24 % before: the usual runs since are lower, 3.98 fps on average, 4.57 over all fourteen | measured: 4.67, 4.28, 3.50 and 3.47 fps in the four usual runs since (c42, c48, c51, c58; the others had switches on for measuring, see the newest update); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
-| Frame rate in the opening cutscene, towards 30 fps | about 15 % | 16 % before | the same runs |
+| Frame rate in the opening cutscene, towards 20 fps | about 20 % | 23 % before: it now counts the usual runs since the morning, 3.96 fps on average, no longer the night's | measured: 3.89, 4.12 and 3.82 fps in the three usual runs at midday (c62, c64, c65), 4.67, 4.28, 3.50 and 3.47 in the four usual runs of the morning (c42, c48, c51, c58; the others had switches on for measuring or an older build, see the two newest updates); the night's code, built again, 4.15 (c61); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 30 fps | about 13 % | 15 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 44 to 53 ms busy in c32-c34, c36 and c37 (30 to 36 the title's lists, 13 to 17 sending and hashing, 1 to 1.5 comparing) at 2,700 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 49 of the last 51 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c58 ran to the end and closed when asked, except c55, where the title stopped on a breakpoint of its own while loading (see the newest update below); and in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 56 of the last 58 short runs | 49 of 51 before | measured: the 75 s cutscene runs c8 to c65 ran to the end and closed when asked, except c55, where the title stopped on a breakpoint of its own while loading (see the newest update below); and in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -81,6 +90,67 @@ another PC.
 The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed, unless they name the cutscene. The estimates
 are my own judgment, not measurements.
+
+### New in this update (2026-11-26, midday): the morning's code is not slower; where the memory goes; what the frame waits for
+
+Seven cutscene runs (c59-c65), 75 s each as before. One switch was added
+(off); nothing else changes what the game does.
+
+- **The morning's changes did not slow the cutscene.** The graphics code of
+  the night before (commit f38b666f) built again and run the same way gave
+  4.15 fps (c61); today's code gave 4.05, 3.89, 4.12 and 3.82 (c60, c62, c64,
+  c65). One run of the old code, and scenes differ from run to run by more
+  than that, but nothing says the morning's code is slower. The night's 4.81
+  on average was most likely the PC's state then.
+- **The title's page pool made committed** (`VICTORY_POOL_COMMIT=1`, off).
+  The card can read a section in place only if it was made committed (run
+  c59's probe: a reserved one is refused as a heap), and the runtime makes the
+  pool reserved. With the switch (c60) all four sections (220, 297, 185 and
+  3,977 MB) were made committed, none refused; 4.05 fps; 1,316 MB free on
+  average and 7,941 pages a second read from disk (c48: 838 MB and 12,320).
+  It stays off: c63 had only 2.2 GB left to commit with the pool reserved,
+  and committing it whole takes 4.7 GB of that. If the commit is refused the
+  section is made reserved, as without the switch.
+- **How far reading in place would reach** (c59's census): of 766 MB of title
+  buffers, 141 MB lie in one run of a pool section (one placed buffer each),
+  241 MB in private memory of which a part can be opened, 383 MB in scattered
+  pages; of 3,824 MB of windows, 2,516 MB are views with pages not mapped. As
+  things are, it would take over only a small part of the copies; the rest
+  needs the directory by 64 KiB page described below.
+- **Where the memory goes** (c62, the game's address space walked from
+  outside: committed and in RAM by kind; c63, the diagnostics build's own
+  count):
+
+  | Whose | Committed | In RAM |
+  |---|---|---|
+  | ours: private memory at host addresses | 19.3 GB | 8.7 GB |
+  | of it, host copies of windows of title memory (4 MiB each) | 2.8 GB | 2.8 GB |
+  | of it, write-combined (memory shared with the card, and the card's own as Windows charges it) | 10.2 GB | 1.3 GB |
+  | the title's heaps | 2.9 GB | 1.7 GB |
+  | the title's views of its page pool (a page counted once per view) | 9.7 GB | 4.0 GB |
+  | our own view of the pool's largest section (the same pages) | 4.0 GB | 2.5 GB |
+
+  Of the windows' 3.4 GB, 1.8 GB lies between the lowest and highest address
+  asked for in each (c63); smaller windows were tried before
+  (`VICTORY_WINDOW_KB=256`, c49: 1.6 GB less, but slower). With the game
+  closed, the other programs open on this PC held 43.8 of its 60.3 GB of
+  commit and 13.5 GB of its 32 GB of RAM, so the game ran with 1.3 to 2.0 GB
+  free. Closing programs before a run would give it more room; not tried.
+- **What the frame waits for** (c64's frame log; c64 and c65 profiled with
+  waits sampled too). In the long frames the title's render thread stands in
+  our present call for most of the frame (175 to 600 ms), until our
+  submitting thread has prepared the frame's ten submissions: 100 to 190 ms
+  preparing, of it 44 to 64 ms copying about 250 MB of title memory; 34 to
+  71 ms of copy-back. That thread also waited 6 to 7 % of the time for earlier
+  submissions to land, because the next one reads what they write. The
+  title's recording threads waited 60 to 66 % of the time on the title's own
+  events, about 5 % on our locks.
+- **The title's busiest thread is its audio thread** (66 to 74 % of a core).
+  About a fifth of its time goes to decoding Opus packets in our
+  `XApuEnqueueCommand`, which decodes each command as it is queued; the rest
+  is the title's own code, nearly all in one region of it. It is not on the
+  frame's path: decoding on a thread of our own would free processor time,
+  nothing more.
 
 ### New in this update (2026-11-26, morning): where the long frames come from; switches measured, none adopted
 

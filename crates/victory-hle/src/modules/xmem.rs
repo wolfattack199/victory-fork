@@ -368,7 +368,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section for physical pages, and whether it was made committed whole.
+struct Section(HANDLE, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -564,6 +565,20 @@ fn kept_views() -> bool {
     *ON
 }
 
+/// Whether sections for physical pages are made committed whole on Windows
+/// as well (`VICTORY_POOL_COMMIT=1`; under Wine they always are). The commit
+/// is charged when made, not when mapped; pages still come from memory only
+/// when first touched. Only such a section opens as a heap for the card
+/// (`victory_gpu::inplace`).
+/// shortcut: off by default. In the opening cutscene it ran clean (run c60:
+/// four sections, 4.7 GB, none refused; 4.05 fps, as without), but the PC
+/// was near its commit limit there (c63: 2.2 GB left to commit with the pool
+/// reserved), and a refused commit falls back to a reserved section.
+fn pool_commit() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
@@ -593,21 +608,37 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far: commit it whole there.
+    // `VICTORY_POOL_COMMIT=1` commits it whole here too (only a committed
+    // section can be opened as a heap for the card), and falls back to a
+    // reserved one if the host refuses the commit.
+    let section_of = |flags: u32| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | flags,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
     };
+    let (mut handle, mut committed) = (std::ptr::null_mut(), false);
+    if on_wine() || pool_commit() {
+        handle = section_of(SEC_COMMIT);
+        committed = !handle.is_null();
+        if !committed && !on_wine() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "a committed section for physical pages was refused: made reserved");
+        }
+    }
+    if handle.is_null() && !on_wine() {
+        handle = section_of(SEC_RESERVE);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -622,8 +653,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    let section = Arc::new(Section(handle, committed));
     let first = {
         let mut physical = physical();
         let first = physical.next_page;
@@ -687,7 +718,7 @@ impl View {
         if kept_views()
             && let Some((at, kept)) = victory_gpu::title_section_view(slice.section.0 as usize, offset, len)
         {
-            return commit(at, len).then_some(View {
+            return commit(&slice.section, at, len).then_some(View {
                 at: MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
                 len,
                 kept: Some(kept),
@@ -709,7 +740,7 @@ impl View {
             return None;
         }
         let view = View { at, len, kept: None };
-        commit(at.Value as usize, len).then_some(view)
+        commit(&slice.section, at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1124,7 +1155,7 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log:
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(&slice.section, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1143,10 +1174,11 @@ fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log:
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// Commits the section pages a view of `section` shows (once per page,
+/// whichever view).
+fn commit(section: &Section, base: usize, len: usize) -> bool {
+    if section.1 {
+        return true; // committed whole when made
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
