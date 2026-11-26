@@ -528,6 +528,11 @@ fn noted(first: usize, last: usize, found: Vec<usize>) -> (u64, Vec<(usize, u64)
     (now, NOTED.range(first, last))
 }
 
+/// Since the last frame-rate line: 4 KiB pages the kernel's write
+/// watch found written, the 64 KiB pages they lie in (what a refresh copies
+/// for them), and 64 KiB blocks the guards found written.
+pub(crate) static GRAIN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// [`writes`], and whether every block of the range is guarded and clean
 /// from here on: until its count changes ([`changes`]) nothing is written.
 pub(crate) fn writes_held(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
@@ -550,6 +555,7 @@ pub(crate) fn writes_held(start: usize, end: usize, guarded: bool) -> Option<(u6
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         let (found, clean) = found?;
+        GRAIN[2].fetch_add(found.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let (now, pages) = noted(first, last, found);
         drop(range);
         return Some((now, pages, clean));
@@ -619,6 +625,20 @@ pub(crate) fn writes_held(start: usize, end: usize, guarded: bool) -> Option<(u6
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+    }
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut pages = 0;
+        let mut last_page = usize::MAX;
+        for &at in &j.found[..found] {
+            if at / PAGE != last_page {
+                last_page = at / PAGE;
+                pages += 1;
+            }
+        }
+        GRAIN[0].fetch_add(found as u64, Relaxed);
+        GRAIN[1].fetch_add(pages, Relaxed);
+        GRAIN[2].fetch_add(guarded.len() as u64, Relaxed);
     }
     let now = next_asking();
     for page in j.found[..found].iter().map(|&at| at / PAGE).chain(guarded) {

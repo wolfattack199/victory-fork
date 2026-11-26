@@ -1343,6 +1343,16 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if len > 0
+        && let Some(known) = mapped_from_views(at, len)
+    {
+        return known == len as u64;
+    }
+    committed_asked(at, len)
+}
+
+/// [`committed`], asked of the kernel.
+fn committed_asked(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -1480,13 +1490,75 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
+    if let Some(known) = mapped_from_views(at, len) {
+        return known;
+    }
+    mapped_bytes_asked(at, len)
+}
+
+/// How many bytes of `[at, at + len)` (`len > 0`) the runtime's views
+/// show, where it lies in a placeholder of the title's and
+/// [`mapped_known_on`]; `None` otherwise. One answer in 64 is asked of the
+/// kernel too, while no remap of the range is under way: the title may
+/// free a placeholder without the runtime's knowing, and its memory be
+/// something else then. Where they disagree the placeholder is forgotten
+/// and the kernel answers.
+fn mapped_from_views(at: *const u8, len: usize) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    if !mapped_known_on() {
+        return None;
+    }
+    let start = at as usize;
+    let known = crate::inplace::mapped_known(start, start.saturating_add(len))?;
+    let n = MAPPED_KNOWN[0].fetch_add(1, Ordering::Relaxed);
+    if n % 64 == 0
+        && let Some(_still) = crate::watch::title_memory_reading_now_at(start, len)
+    {
+        MAPPED_KNOWN[1].fetch_add(1, Ordering::Relaxed);
+        let asked = mapped_bytes_asked(at, len);
+        if asked != known {
+            MAPPED_KNOWN[2].fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                address = format_args!("{start:#x}"),
+                len,
+                known,
+                asked,
+                "how much of a texture is mapped: the runtime's views and the kernel disagree"
+            );
+            crate::inplace::placeholder_forget(start);
+            return None;
+        }
+    }
+    Some(known)
+}
+
+/// Whether [`mapped_bytes`] and [`committed`] answer from the runtime's
+/// views where they can (`VICTORY_MAPPED_KNOWN=0`: they ask the kernel).
+/// Asking the kernel, one question for the pages of a texture and a
+/// one-byte read for each that is not in the working set, took 25
+/// microseconds a texture: 13-15 ms a frame of a recording thread for how
+/// much was mapped in the opening cutscene (runs c27, c31), 1.0 ms with the
+/// views (c32); the whole pass over textures picked by index 25-32 ms a
+/// frame, 20 ms, and 11.7 ms with [`committed`] answered too (c33). Of
+/// 12,181 answers also asked of the kernel none disagreed (c33).
+fn mapped_known_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_KNOWN").is_none_or(|v| v != "0"))
+}
+
+/// Answers of [`mapped_bytes`] and [`committed`] from the runtime's views, of them checked
+/// against the kernel, and of those that disagreed; since the start.
+pub(crate) static MAPPED_KNOWN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`mapped_bytes`], asked of the kernel.
+fn mapped_bytes_asked(at: *const u8, len: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if !committed_asked(at, 1) && !committed_asked((end - 1) as *const u8, 1) {
         return 0;
     }
     if !by_query() {

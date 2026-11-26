@@ -157,6 +157,13 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_RESERVE != 0 {
+        // A placeholder only views of physical pages fill: the GPU side
+        // answers how much of a texture there is mapped from the views it
+        // is told of. Other memory reserved where a placeholder was: the
+        // title freed that one.
+        victory_gpu::title_memory_placeholder(at as usize, size, placeholder);
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {

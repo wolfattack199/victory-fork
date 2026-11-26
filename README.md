@@ -19,19 +19,24 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 859 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate here). In one of two whole runs the graphics crate's test program stopped on an access violation while that test and others were under way; 14 runs of that program after it had none. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` failed in most runs today, also on the commit before this one: it took for granted which group of 64 records the card runs first, and now accepts either |
+| Checks | 860 tests pass, 1 fails, 15 are ignored (2026-11-26, night). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
-| Frame rate in the opening cutscene | **about 4.2 fps** (2026-11-26, later: 4.63 and 3.85 in two runs of the same length), about 3.5 in the five runs before (2.9 to 4.0), about 2.0 before that. Still far from 30 |
+| Frame rate in the opening cutscene | **about 5.2 fps** (2026-11-26, night: 4.87, 5.17 and 5.48 in three runs of the same length), about 4.0 in the three clean runs before (3.41 to 4.63; the "about 4.2" said here before was two of them), about 3.5 before that, about 2.0 before that. Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
 ### Working on right now
 
-- **Frame rate in the opening cutscene: 30 fps is the aim.** A frame now has
-  two halves of about 200 ms each (run c24, 2.5 ms steps): first one thread of
+- **Frame rate in the opening cutscene: 30 fps is the aim.** The pass over
+  the textures shaders pick by index now takes 12 to 13 ms a frame (25 to 32
+  before, runs c33 and c34). The process uses about 5 of the PC's 6 cores (profile of
+  run c31), so what costs processor time is what holds the frame back. Next:
+  the descriptor tables and binding before each draw (about a core in all), and
+  the copies of title memory (about two thirds of a core). In run c24 a frame had
+  two halves of about 200 ms each (2.5 ms steps): first one thread of
   the title's works alone while ours stand idle, then our submitting thread and
   its four helpers work (hashing, copies of title memory, descriptor tables,
   textures) while the title waits for them. What that title thread does is
@@ -58,14 +63,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 21 % | about 17 % before | measured: 4.63 and 3.85 fps in two runs with remaps holding only what they change (c23, c24), 4.24 on average; 2.86 to 3.97 in five runs before it (c13-c16, c19), 3.55 on average; about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run (2,100 and 3,200 draws a frame in c23 and c24), so two runs say the direction more surely than the size |
-| Frame rate in the opening cutscene, towards 30 fps | about 14 % | about 12 % before | the same runs |
-| Card time a frame, towards the 50 ms of 20 fps | about 88 % | 66 % before, at more draws | measured: 54 to 60 ms busy in the last four runs (35 to 49 the title's lists, 9 to 19 sending and hashing, 2 comparing) at 2,900 to 3,900 draws a frame; it was 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
+| Frame rate in the opening cutscene, towards 20 fps | about 26 % | about 20 % before (21 % was said: two runs of three) | measured: 4.87, 5.17 and 5.48 fps in three runs with textures' memory asked of the runtime (c32-c34), 5.17 on average, at 2,966 to 3,287 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 30 fps | about 17 % | about 13 % before | the same runs |
+| Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 49.5 to 52.8 ms busy in c32-c34 (34 to 35 the title's lists, 15 to 17 sending and hashing, 1.4 comparing) at 3,000 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 17 of the last 17 short runs | 4 of 6 before | measured: the 75 s cutscene runs c8 to c24 ran to the end and closed cleanly. Longest frame 1.3 and 1.7 s in c23 and c24; 2.4 to 10.8 s in runs before |
+| Runs that finish | 27 of the last 27 short runs | 17 of 17 before | measured: the 75 s cutscene runs c8 to c34 ran to the end and closed cleanly. Longest frame 1.28, 0.65 and 1.10 s in c32-c34; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -77,7 +82,51 @@ The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed, unless they name the cutscene. The estimates
 are my own judgment, not measurements.
 
-### New in this update (2026-11-26, later): remaps hold only what they change
+### New in this update (2026-11-26, night): textures' memory asked of the runtime, about 5.2 fps
+
+| Runs (75 s each, the opening cutscene) | How much of a texture's memory is there, asked of | fps |
+|---|---|---|
+| c23, c24, c27 | Windows, page by page | 4.63, 3.85, 3.41 |
+| c32 | the runtime (how much is mapped) | 4.87 |
+| c33 | the runtime (that, and whether all of it is there) | 5.17 |
+| c34 | the same, on by default (no switch given) | 5.48 |
+
+- **What it cost.** Before a texture that shaders pick by index is drawn, the
+  graphics side asks how much of its memory is mapped (textures stream in, and
+  the runtime maps their pages as they arrive), and before one is read,
+  whether all of it is there. Each was a question to Windows for its pages and
+  a one-byte read for each page not in the working set: about 25 µs a texture,
+  400 to 500 textures a frame, on the thread that records the title's commands.
+  That asking took 13 to 15 ms a frame (runs c27, c31), and the whole pass
+  over those textures 25 to 32 ms. Now: 0.7 to 1.0 ms, and 11.7 and 13.0 ms
+  (c33, c34).
+- **How.** The runtime now tells the graphics side of the placeholders it
+  reserves for physical pages, as it already told of every view it maps into
+  them. Inside a placeholder, what the views show is what is mapped
+  (`crates/victory-gpu/src/inplace.rs`, `crates/victory-gpu/src/texture.rs`,
+  `crates/victory-hle/src/modules/xmem.rs`). The runtime tells of a view after
+  it is mapped and of its end before it is unmapped, so the answer is never
+  more than Windows would give. `VICTORY_MAPPED_KNOWN=0` asks Windows again.
+- **Checked against Windows while it runs.** One answer in 64 is also asked of
+  Windows, while no remap of that memory is under way. Where the two differ,
+  that placeholder is asked of Windows from then on and a warning is logged.
+  None differed: 4,820 checks in c32, 12,181 in c33, 10,514 in c34. The title can free a
+  placeholder without the runtime's knowing; memory the runtime reserves over
+  one makes it forget that one too. A wrong answer would say a texture is not
+  there yet, never that memory is there when it is not.
+- **Tried, no gain.** Setting the title's fences as soon as its work is sent
+  (`VICTORY_FENCE_EARLY=1`, for measuring only: frames can show before they are
+  done): 3.46 fps (c30), so waiting for the card's fences is not what holds the
+  frame. Presenting on another thread (c29): no gain, the submitting thread's
+  work grew as much as it saved.
+- **New log lines** for measuring: the bytes of the host copies of title
+  memory refreshed each frame, split into those found written and those copied
+  whole, and the 4 KiB pages Windows' write watch found against the 64 KiB
+  blocks the guards found.
+- A test checks the answer from the views: inside a placeholder, reaching out
+  of one, a view taken away, and a placeholder reserved over or forgotten.
+
+### The update before (remaps hold only what they change, about 4.0 fps)
 
 | Runs (75 s each, the opening cutscene) | Lock while the title remaps its memory | fps |
 |---|---|---|
@@ -251,6 +300,9 @@ place) and because the card was full (`VICTORY_LEVELS_ON_DEMAND=1`).
 
 ### Corrections
 
+- **The cutscene's "about 4.2 fps" in the update before was two runs.** The
+  third clean run after that change (c27) made 3.41 fps; the three together
+  3.96.
 - **These are not the highest frame rates anyone has.** fxceless's fork, which
   much of this comes from, reports 8 to 10 fps in the same rooms on an
   i7-14700KF with an RTX 4070 (97 to 104 ms at about 3,850 draws). What can be

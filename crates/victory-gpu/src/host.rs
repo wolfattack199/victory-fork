@@ -3624,7 +3624,8 @@ mod fill_check {
                 seen.push((key.0, key.1, 1));
                 if seen.len() <= 12 {
                     tracing::info!(
-                        "a fill of upload memory waits for flights: {len} bytes at {src:#x}; the range shaders may write that it                          touches: {:#x}+{:#x} ({} ranges in the air); frame {}",
+                        "a fill of upload memory waits for flights: {len} bytes at {src:#x}; the range shaders may write that it \
+                         touches: {:#x}+{:#x} ({} ranges in the air); frame {}",
                         touched.0,
                         touched.1 - touched.0,
                         written.len(),
@@ -3661,7 +3662,8 @@ mod fill_check {
             if bad <= 12 {
                 let first = before.iter().zip(&now).position(|(a, b)| a != b).unwrap_or(0);
                 tracing::info!(
-                    "a fill of upload memory that waited for flights read other bytes after the wait: {differ} of {len} bytes at                      {src:#x} changed, the first at +{first:#x} (check {n}, frame {})",
+                    "a fill of upload memory that waited for flights read other bytes after the wait: {differ} of {len} bytes at \
+                     {src:#x} changed, the first at +{first:#x} (check {n}, frame {})",
                     crate::frame::current()
                 );
             }
@@ -3696,7 +3698,8 @@ mod fill_check {
                     };
                     let (s, d) = (range(src), range(dst));
                     tracing::info!(
-                        "a title buffer copy waits for flights: {len} bytes from {src:#x} to {dst:#x}; source in a range shaders may                          write: {by_src} ({:#x}+{:#x}); destination: {by_dst} ({:#x}+{:#x}); {} ranges in the air; frame {}",
+                        "a title buffer copy waits for flights: {len} bytes from {src:#x} to {dst:#x}; source in a range shaders may \
+                         write: {by_src} ({:#x}+{:#x}); destination: {by_dst} ({:#x}+{:#x}); {} ranges in the air; frame {}",
                         s.0,
                         s.1 - s.0,
                         d.0,
@@ -3739,7 +3742,8 @@ mod fill_check {
         if (src_changed || dst_changed) && COPIES[1].load(Relaxed) + COPIES[2].load(Relaxed) <= 16 {
             let differ = |x: &[u8], y: &[u8]| x.iter().zip(y).filter(|(p, q)| p != q).count();
             tracing::info!(
-                "a title buffer copy that waited for flights found other bytes after the wait: {len} bytes from {src:#x} to {dst:#x};                  {} source bytes changed, {} destination bytes changed (check {n}, frame {})",
+                "a title buffer copy that waited for flights found other bytes after the wait: {len} bytes from {src:#x} to {dst:#x}; \
+                 {} source bytes changed, {} destination bytes changed (check {n}, frame {})",
                 differ(&a, &src_before),
                 differ(&b, &dst_before),
                 crate::frame::current()
@@ -3757,7 +3761,8 @@ mod fill_check {
             let most: Vec<String> =
                 most.iter().take(6).map(|s| format!("{:#x}->{:#x}+{:#x} {}x", s.0, s.1, s.2, s.3)).collect();
             tracing::info!(
-                "title buffer copies that waited for flights, since the start: {copies} checked after their wait; the source had                  other bytes after it {} times, the destination {} times; {} distinct copies, the most frequent: {}",
+                "title buffer copies that waited for flights, since the start: {copies} checked after their wait; the source had \
+                 other bytes after it {} times, the destination {} times; {} distinct copies, the most frequent: {}",
                 COPIES[1].load(Relaxed),
                 COPIES[2].load(Relaxed),
                 seen.len(),
@@ -3773,7 +3778,8 @@ mod fill_check {
         most.sort_unstable_by_key(|s| std::cmp::Reverse(s.2));
         let most: Vec<String> = most.iter().take(6).map(|s| format!("{:#x}+{:#x} {}x", s.0, s.1, s.2)).collect();
         tracing::info!(
-            "fills of upload memory that waited for flights, since the start: {n} checked after their wait, {} of them read other              bytes than before it ({} bytes in all); {} distinct fills (page, length), the most frequent: {}",
+            "fills of upload memory that waited for flights, since the start: {n} checked after their wait, {} of them read other \
+             bytes than before it ({} bytes in all); {} distinct fills (page, length), the most frequent: {}",
             CHECKED[1].load(Relaxed),
             CHECKED[2].load(Relaxed),
             seen.len(),
@@ -3856,7 +3862,7 @@ fn picked_due(runs: &[&HostList]) -> (usize, Vec<crate::descriptor::host::Span>)
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
-    if !late() {
+    if !late() || fence_early() {
         return false;
     }
     let mut line = line();
@@ -3871,6 +3877,24 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
     true
+}
+
+/// A measurement, not a fix (`VICTORY_FENCE_EARLY=1`; off by default): a
+/// fence the title signals on a queue is set as soon as what came before
+/// it is sent to the card, not when it has run and its results are back in
+/// title memory. What the title reads after such a fence may be old, so
+/// the picture may be wrong. It says whether the time from the title's
+/// signal to the fence (120-290 ms in run c22) is what the title's next
+/// frame waits for.
+fn fence_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FENCE_EARLY").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("fences are set before what came before them has run (VICTORY_FENCE_EARLY=1, a measurement): the picture may be wrong");
+        }
+        on
+    })
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -9115,7 +9139,8 @@ impl Meter {
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its \
+                 pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
             );
@@ -9133,12 +9158,25 @@ impl Meter {
             let held = crate::pipeline::WALKS_HELD.swap(0, Ordering::Relaxed);
             if held > 0 {
                 tracing::info!(
-                    "dispatches of programs that walk ray-tracing structures held back per frame (VICTORY_BVH_HOLD=1; the                      builder has not built them): {:.1}",
+                    "dispatches of programs that walk ray-tracing structures held back per frame (VICTORY_BVH_HOLD=1; the \
+                     builder has not built them): {:.1}",
                     held as f64 / frames
                 );
             }
         }
         crate::shadow::back_line(frames);
+        {
+            let [watched, whole] = [0, 1].map(|i| crate::shadow::FREE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+            let [small, pages, blocks] = [0, 1, 2].map(|i| crate::watch::GRAIN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if watched + whole > 0.0 {
+                tracing::info!(
+                    "host copies of title memory refreshed per frame: {watched:.1} MB by the pages found written, {whole:.1} MB \
+                     whole (memory nobody watches); the kernel's write watch found {small:.0} pages of 4 KiB written in \
+                     {pages:.0} of 64 KiB ({:.0} % of those), the guards {blocks:.0} blocks of 64 KiB",
+                    if pages > 0.0 { 100.0 * small / (pages * 16.0) } else { 0.0 }
+                );
+            }
+        }
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -9169,6 +9207,14 @@ impl Meter {
                 })
                 .collect();
             tracing::info!("the pass over textures picked by index, per frame: {}", parts.join(", "));
+            let [known, checked, differed] =
+                [0, 1, 2].map(|i| crate::texture::MAPPED_KNOWN[i].load(Ordering::Relaxed));
+            if known > 0 {
+                tracing::info!(
+                    "how much of a texture is mapped, answered from the runtime's views (VICTORY_MAPPED_KNOWN=0: asked of the kernel): {known} since \
+                     the start, {checked} of them asked of the kernel too, {differed} disagreed"
+                );
+            }
             let [blocks, placed] = [0, 1].map(|i| crate::slabs::PLACED[i].load(Ordering::Relaxed));
             let [made, again] = [0, 1].map(|i| crate::slabs::UPLOADS[i].load(Ordering::Relaxed));
             let (free, resting, whole) = crate::slabs::free_bytes();
@@ -9280,7 +9326,11 @@ impl Meter {
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the \
+                     title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to \
+                     plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped); \
+                     {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}) \
+                     (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },

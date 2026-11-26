@@ -373,6 +373,78 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// The title's reservations that only views of physical pages fill
+/// (placeholders), by address: their bytes. Where no view is, nothing is.
+static PLACEHOLDERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn placeholders() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
+    PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The runtime reserved `[at, at + len)`: as a placeholder for views of
+/// physical pages ([`title_memory_view`]) if `placeholder`, where what no
+/// view shows is not memory; otherwise as other memory, and a placeholder
+/// remembered there was freed (by the title, which the runtime is not
+/// told of) and is forgotten.
+pub fn title_memory_placeholder(at: usize, len: usize, placeholder: bool) {
+    let end = at.saturating_add(len);
+    let mut p = placeholders();
+    let gone: Vec<usize> = p
+        .range(..end)
+        .rev()
+        .take_while(|(base, bytes)| *base + **bytes > at)
+        .map(|(base, _)| *base)
+        .collect();
+    for base in gone {
+        p.remove(&base);
+    }
+    if placeholder {
+        p.insert(at, len);
+    }
+}
+
+/// The placeholder that holds `at` is forgotten: the kernel found it not
+/// as the views say (freed by the title, which the runtime is not told).
+pub(crate) fn placeholder_forget(at: usize) {
+    let mut p = placeholders();
+    if let Some((&base, &bytes)) = p.range(..=at).next_back()
+        && base + bytes > at
+    {
+        p.remove(&base);
+        tracing::warn!(
+            address = format_args!("{base:#x}"),
+            bytes,
+            "a placeholder of the title's was not as its views say: asked of the kernel from now on"
+        );
+    }
+}
+
+/// How many bytes of `[start, end)` the title's views show, if all of it
+/// lies in one placeholder ([`title_memory_placeholder`]), where what no
+/// view shows is not memory; `None` otherwise. The runtime tells of a view
+/// after mapping it and of its end before unmapping it, so this is never
+/// more than the kernel would find.
+pub(crate) fn mapped_known(start: usize, end: usize) -> Option<u64> {
+    {
+        let p = placeholders();
+        let (&base, &bytes) = p.range(..=start).next_back()?;
+        if base.saturating_add(bytes) < end {
+            return None;
+        }
+    }
+    let v = views();
+    let mut there = 0usize;
+    if let Some((&base, &(bytes, ..))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        there += (base + bytes).min(end) - start;
+    }
+    for (&base, &(bytes, ..)) in v.views.range(start.saturating_add(1)..end) {
+        there += (base + bytes).min(end) - base;
+    }
+    Some(there as u64)
+}
+
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
@@ -1330,6 +1402,38 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// In a placeholder the views say how much is mapped; outside one, or
+    /// reaching out of one, nothing is said.
+    #[test]
+    fn mapped_known_counts_the_views_in_a_placeholder() {
+        let at = 0x7_8000_0000usize;
+        let k = K64;
+        assert_eq!(mapped_known(at, at + k), None, "no placeholder yet");
+        title_memory_placeholder(at, 8 * k, true);
+        assert_eq!(mapped_known(at, at + 8 * k), Some(0));
+        title_memory_view(at + k, 2 * k, 78, 0);
+        title_memory_view(at + 5 * k, k, 78, 9 * k as u64);
+        assert_eq!(mapped_known(at, at + 8 * k), Some(3 * k as u64));
+        assert_eq!(mapped_known(at + k + 100, at + 2 * k), Some((k - 100) as u64));
+        assert_eq!(mapped_known(at + 3 * k, at + 5 * k), Some(0));
+        assert_eq!(mapped_known(at + 4 * k, at + 6 * k + 10), Some(k as u64));
+        assert_eq!(mapped_known(at + 7 * k, at + 9 * k), None, "reaches out of it");
+        assert_eq!(mapped_known(at - k, at + k), None, "starts before it");
+        views_gone(at + 2 * k, 1);
+        assert_eq!(mapped_known(at, at + 8 * k), Some(k as u64), "the view of two pages is gone whole");
+        // Reserved again over part of it: the old one is forgotten.
+        title_memory_placeholder(at + 4 * k, 2 * k, true);
+        assert_eq!(mapped_known(at, at + k), None);
+        assert_eq!(mapped_known(at + 4 * k, at + 6 * k), Some(k as u64));
+        placeholder_forget(at + 5 * k);
+        assert_eq!(mapped_known(at + 4 * k, at + 6 * k), None);
+        // Other memory reserved over a placeholder: it is forgotten.
+        title_memory_placeholder(at + 4 * k, 2 * k, true);
+        title_memory_placeholder(at + 5 * k, k, false);
+        assert_eq!(mapped_known(at + 4 * k, at + 5 * k), None);
+        views_gone(at, 8 * k);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

@@ -2022,6 +2022,11 @@ fn merge_gap() -> usize {
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
 }
 
+/// Since the last frame-rate line: bytes refreshes of host copies took
+/// from title memory by the pages found written, and whole (memory nobody
+/// watches).
+pub(crate) static FREE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether a refresh of a copy in the card's memory stores and sends on
 /// only the bytes that differ from the copy's CPU side
 /// (`VICTORY_COPY_CHANGED=1`; `alt`: twenty seconds with, twenty without,
@@ -3515,6 +3520,12 @@ impl Shadow {
     /// shader writes, or (`snapshot`) where only shaders that have not run
     /// write: what is copied goes into the snapshot too.
     fn update_free(&self, from: usize, to: usize, snapshot: bool) -> usize {
+        let copied = self.update_free_counted(from, to, snapshot);
+        FREE_BYTES[usize::from(self.watched.load(Ordering::Relaxed) == NOT_WATCHED)].fetch_add(copied as u64, Ordering::Relaxed);
+        copied
+    }
+
+    fn update_free_counted(&self, from: usize, to: usize, snapshot: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if !snapshot && self.quiet_over(from, to) {
                 crate::watch::quiet();
@@ -3594,7 +3605,8 @@ impl Shadow {
                                 refreshed = format_args!("{from:#x}..{to:#x}"),
                                 on_the_card = self.card.is_some(),
                                 window = self.window,
-                                "a host copy of title memory is stale after its refresh, three times in a row:                                  the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                                "a host copy of title memory is stale after its refresh, three times in a row: \
+                                 the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
                             );
                         }
                     }

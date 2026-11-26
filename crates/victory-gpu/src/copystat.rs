@@ -751,7 +751,10 @@ fn log_memory() {
     );
     let targets = crate::resource::targets_census();
     tracing::info!(
-        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB); \
+         of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no \
+         list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host \
+         copied into {:.0} MB",
         targets[0],
         mb(targets[1]),
         targets[10],
@@ -806,7 +809,8 @@ fn log_memory() {
         mb(made[5]),
     );
     tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
+        "memory, placed textures: {} of them were asked for again with other filler words in their description \
+         (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
     // What the line above leaves open: what is alive of the buffers "made
@@ -817,7 +821,14 @@ fn log_memory() {
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     tracing::info!(
-        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
+        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of \
+         them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload \
+         buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their \
+         pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass \
+         over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap \
+         whose slot showed another copy than the one brought up to date: {}; distinct views \
+         kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB \
+         {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
         alive[1],
         mb(alive[2]),

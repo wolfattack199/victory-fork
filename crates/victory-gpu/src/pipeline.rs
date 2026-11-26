@@ -368,7 +368,8 @@ pub(crate) fn walk_held(this: This) -> bool {
         ONCE.call_once(|| {
             tracing::info!(
                 shaders = ?p.shaders,
-                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not \
+                 built them (VICTORY_BVH_HOLD=1); the first one"
             );
         });
     }
