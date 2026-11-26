@@ -423,8 +423,14 @@ pub(crate) fn placeholder_forget(at: usize) {
 /// lies in one placeholder ([`title_memory_placeholder`]), where what no
 /// view shows is not memory; `None` otherwise. The runtime tells of a view
 /// after mapping it and of its end before unmapping it, so this is never
-/// more than the kernel would find.
+/// more than the kernel would find. As `crate::texture::mapped_bytes`
+/// answers when it asks the kernel: none if neither the first nor the last
+/// byte is shown, whatever the views between show (run c35: 6 of 11 pages
+/// shown between two that were not, the kernel's answer none).
 pub(crate) fn mapped_known(start: usize, end: usize) -> Option<u64> {
+    if start >= end {
+        return Some(0);
+    }
     {
         let p = placeholders();
         let (&base, &bytes) = p.range(..=start).next_back()?;
@@ -433,6 +439,10 @@ pub(crate) fn mapped_known(start: usize, end: usize) -> Option<u64> {
         }
     }
     let v = views();
+    let shows = |at: usize| v.views.range(..=at).next_back().is_some_and(|(&base, &(bytes, ..))| base + bytes > at);
+    if !shows(start) && !shows(end - 1) {
+        return Some(0);
+    }
     let mut there = 0usize;
     if let Some((&base, &(bytes, ..))) = v.views.range(..=start).next_back()
         && base + bytes > start
@@ -1415,14 +1425,18 @@ mod tests {
         assert_eq!(mapped_known(at, at + 8 * k), Some(0));
         title_memory_view(at + k, 2 * k, 78, 0);
         title_memory_view(at + 5 * k, k, 78, 9 * k as u64);
-        assert_eq!(mapped_known(at, at + 8 * k), Some(3 * k as u64));
+        assert_eq!(mapped_known(at + k, at + 6 * k), Some(3 * k as u64));
         assert_eq!(mapped_known(at + k + 100, at + 2 * k), Some((k - 100) as u64));
         assert_eq!(mapped_known(at + 3 * k, at + 5 * k), Some(0));
-        assert_eq!(mapped_known(at + 4 * k, at + 6 * k + 10), Some(k as u64));
+        assert_eq!(mapped_known(at + 2 * k, at + 6 * k + 10), Some(2 * k as u64), "the first byte shown");
+        // Neither end shown: none, as the kernel's answer has it, though a
+        // view lies between.
+        assert_eq!(mapped_known(at + 4 * k, at + 7 * k), Some(0));
+        assert_eq!(mapped_known(at + 4 * k + 5, at + 6 * k), Some(k as u64), "the last byte shown");
         assert_eq!(mapped_known(at + 7 * k, at + 9 * k), None, "reaches out of it");
         assert_eq!(mapped_known(at - k, at + k), None, "starts before it");
         views_gone(at + 2 * k, 1);
-        assert_eq!(mapped_known(at, at + 8 * k), Some(k as u64), "the view of two pages is gone whole");
+        assert_eq!(mapped_known(at + k, at + 6 * k), Some(k as u64), "the view of two pages is gone whole");
         // Reserved again over part of it: the old one is forgotten.
         title_memory_placeholder(at + 4 * k, 2 * k, true);
         assert_eq!(mapped_known(at, at + k), None);

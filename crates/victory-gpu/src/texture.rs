@@ -1504,8 +1504,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// [`mapped_known_on`]; `None` otherwise. One answer in 64 is asked of the
 /// kernel too, while no remap of the range is under way: the title may
 /// free a placeholder without the runtime's knowing, and its memory be
-/// something else then. Where they disagree the placeholder is forgotten
-/// and the kernel answers.
+/// something else then. Where they disagree the kernel answers, and every
+/// fourth time the placeholder is forgotten.
 fn mapped_from_views(at: *const u8, len: usize) -> Option<u64> {
     use std::sync::atomic::Ordering;
     if !mapped_known_on() {
@@ -1520,16 +1520,23 @@ fn mapped_from_views(at: *const u8, len: usize) -> Option<u64> {
         MAPPED_KNOWN[1].fetch_add(1, Ordering::Relaxed);
         let asked = mapped_bytes_asked(at, len);
         if asked != known {
-            MAPPED_KNOWN[2].fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                address = format_args!("{start:#x}"),
-                len,
-                known,
-                asked,
-                "how much of a texture is mapped: the runtime's views and the kernel disagree"
-            );
-            crate::inplace::placeholder_forget(start);
-            return None;
+            // The kernel answers this time; a placeholder the title freed
+            // disagrees again and again, and is forgotten at the fourth.
+            let differed = MAPPED_KNOWN[2].fetch_add(1, Ordering::Relaxed) + 1;
+            if differed <= 20 {
+                tracing::warn!(
+                    address = format_args!("{start:#x}"),
+                    len,
+                    known,
+                    asked,
+                    differed,
+                    "how much of a texture is mapped: the runtime's views and the kernel disagree"
+                );
+            }
+            if differed % 4 == 0 {
+                crate::inplace::placeholder_forget(start);
+            }
+            return Some(asked);
         }
     }
     Some(known)
@@ -1543,7 +1550,11 @@ fn mapped_from_views(at: *const u8, len: usize) -> Option<u64> {
 /// much was mapped in the opening cutscene (runs c27, c31), 1.0 ms with the
 /// views (c32); the whole pass over textures picked by index 25-32 ms a
 /// frame, 20 ms, and 11.7 ms with [`committed`] answered too (c33). Of
-/// 12,181 answers also asked of the kernel none disagreed (c33).
+/// 12,181 answers also asked of the kernel none disagreed (c33). In c35 one
+/// did, a texture whose two ends were not mapped and six pages between
+/// were (the kernel's answer is none then, and the views' answer is now
+/// too); the title's 16 GB placeholder was forgotten for it, and the pass
+/// asked the kernel again for the rest of the run (3.43 fps).
 fn mapped_known_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_KNOWN").is_none_or(|v| v != "0"))
