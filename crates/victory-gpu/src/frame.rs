@@ -49,11 +49,16 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    // At most the interval of `VICTORY_FRAME_RATE` frames a second, if set.
+    let interval = match frame_rate() {
+        Some(rate) => asked.min(Duration::from_micros(1_000_000 / u64::from(rate))),
+        None => asked,
+    };
+    tracing::info!(?asked, ?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +71,24 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// The frame rate the title's clock may tick at, above the one it asks for
+/// (`VICTORY_FRAME_RATE`: 31 to 240 frames a second; unset, as asked).
+///
+/// The title asks for a frame every 33.333 ms, the console's 30 a second,
+/// and waits for each tick; that is its cap, which only matters once frames
+/// are made faster. Faster ticks let it begin frames as soon as they are
+/// ready, up to the rate given. Whatever in the title counts frames rather
+/// than time then runs faster too: to be tested in play.
+fn frame_rate() -> Option<u32> {
+    static RATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| rate_of(std::env::var("VICTORY_FRAME_RATE").ok().as_deref()))
+}
+
+/// The rate `VICTORY_FRAME_RATE` asks for: 31 to 240, else none.
+fn rate_of(set: Option<&str>) -> Option<u32> {
+    set?.trim().parse::<u32>().ok().filter(|r| (31..=240).contains(r))
 }
 
 /// Device method: events are scheduled at every tick.
@@ -237,6 +260,18 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_rate_is_asked_for_in_range() {
+        assert_eq!(rate_of(None), None);
+        assert_eq!(rate_of(Some("")), None);
+        assert_eq!(rate_of(Some("30")), None);
+        assert_eq!(rate_of(Some(" 60 ")), Some(60));
+        assert_eq!(rate_of(Some("120")), Some(120));
+        assert_eq!(rate_of(Some("240")), Some(240));
+        assert_eq!(rate_of(Some("1000")), None);
+        assert_eq!(rate_of(Some("fast")), None);
+    }
 
     #[test]
     fn a_moment_is_fewer_frames_at_a_slow_pace() {

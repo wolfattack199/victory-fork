@@ -719,6 +719,8 @@ fn create() -> windows::core::Result<Host> {
         }
         // Or only kept off most of the processor (`VICTORY_DRIVER_PROCESSORS`).
         crate::calm::start();
+        // And its pages kept from Windows' trimming (`VICTORY_KEEP_RESIDENT`).
+        crate::resident::start();
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -3815,9 +3817,21 @@ fn stale_under_flights(runs: &[&HostList], picked: &[crate::descriptor::host::Sp
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
+        // For measuring (`VICTORY_MERGE_RUNS_WIDE=1`, `alt`: in turn; off by
+        // default): a cap of 32,768. Run m33 settled 0.4 to 0.6 times a
+        // frame for too many runs, 10 to 11.5 ms of the submitting thread
+        // waiting for the card a frame; each run is a copy of its own on
+        // the card, so the card may pay what the thread saves. Measured in
+        // turns: no gain, hence off.
+        static WIDE: crate::turns::Switch = crate::turns::Switch::new(
+            "VICTORY_MERGE_RUNS_WIDE",
+            false,
+            "up to 32,768 changed runs put in under flights' writes before they are settled",
+        );
+        let cap = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4096, |n| n.clamp(1, 1 << 16))
         });
+        let mut runs_left = if WIDE.on() { cap.max(32_768) } else { cap };
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -9158,11 +9172,15 @@ impl Meter {
             let [blocks, placed] = [0, 1].map(|i| crate::slabs::PLACED[i].load(Ordering::Relaxed));
             let [made, again] = [0, 1].map(|i| crate::slabs::UPLOADS[i].load(Ordering::Relaxed));
             let (free, resting, whole) = crate::slabs::free_bytes();
+            let [cut_blocks, cut, cut_bytes] = [0, 1, 2].map(|i| crate::slabs::CUT[i].load(Ordering::Relaxed));
             tracing::info!(
                 "textures placed in blocks of the card's memory: {placed} since the start, {blocks} blocks of 64 MB, of their \
-                 bytes {} MB free ({whole} blocks wholly) and {} MB resting; upload buffers made {made}, used again {again}",
+                 bytes {} MB free ({whole} blocks wholly) and {} MB resting; upload buffers made {made}, used again {again}; \
+                 staging buffers cut from blocks of upload memory (VICTORY_UPLOAD_PIECES) {cut} since the start, {cut_blocks} \
+                 blocks of 32 MB, {} MB of them in use",
                 free >> 20,
-                resting >> 20
+                resting >> 20,
+                cut_bytes >> 20
             );
             let guards: [f64; 10] =
                 std::array::from_fn(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);

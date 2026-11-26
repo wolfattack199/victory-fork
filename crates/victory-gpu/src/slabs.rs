@@ -288,13 +288,206 @@ fn spare_bytes() -> u64 {
     })
 }
 
-/// A mapped upload buffer of `size` bytes or more: the buffer, its memory,
-/// its bytes, and whether it was used before (its bytes are then what its
-/// last user left, not zeros).
-pub(crate) fn upload(host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
+/// The bytes of a block of upload memory that staging buffers are cut from.
+const PIECE_BLOCK: u64 = 32 << 20;
+/// The largest staging buffer cut from a block; larger ones are upload
+/// buffers of their own, as before.
+const PIECE_LARGEST: u64 = 8 << 20;
+/// What a piece's place and size are whole multiples of: more than the 512
+/// bytes a copy from a buffer into a texture needs its start aligned to.
+const PIECE_GRAIN: u64 = 4 << 10;
+
+/// Whether staging buffers of up to [`PIECE_LARGEST`] bytes are cut from
+/// blocks of upload memory made and mapped once (`VICTORY_UPLOAD_PIECES`:
+/// `0` off, `alt` twenty seconds with and twenty without, in turn; on by
+/// default).
+///
+/// Why: each staging buffer was an upload buffer of its own, and making one
+/// is a new allocation of the driver's, mapped, which waits for the card's
+/// paging of it. The title's recording threads make them when they first
+/// use a texture. In the opening cutscene, run c12, frames of 1.8 to 2.4 s
+/// made 1,400 to 2,700 of them each, while the card stood idle: five of the
+/// title's threads were in that making (allocation, map, the wait) at the
+/// moments its render thread waited for them. Spares were found for about
+/// three in four; a scene's new textures came in bursts the spares did not
+/// hold.
+///
+/// Measured, the opening cutscene, runs of the same length: 2.86, 3.97 and
+/// 3.72 fps with it (c13-c15), 1.58 to 2.61 without (seven runs, about 2.0
+/// on average); upload buffers made in a run went from about 25,000 to
+/// some 50, and the longest frames from 2.2-3.7 s to 1.7-2.4 s.
+///
+/// A piece is given back when its staging buffer is dropped, which is after
+/// the last list that named it ran: the same moment a spare buffer was kept
+/// for the next texture before. Blocks wholly free for [`PIECES_IDLE`] go,
+/// but one: in run c13 (64 MB blocks, ten seconds) bursts of new textures
+/// left 28 to 35 blocks alive while 50 to 630 MB of them were in use.
+fn pieces_wanted() -> bool {
+    static SWITCH: crate::turns::Switch = crate::turns::Switch::new(
+        "VICTORY_UPLOAD_PIECES",
+        true,
+        "staging buffers are cut from blocks of upload memory made once",
+    );
+    SWITCH.on()
+}
+
+/// How long a block pieces are cut from is kept wholly free.
+const PIECES_IDLE: Duration = Duration::from_secs(2);
+
+/// The bytes all blocks pieces are cut from may hold
+/// (`VICTORY_UPLOAD_PIECES_MB`, 1536); past them a staging buffer is an
+/// upload buffer of its own, as before. Upload memory is the PC's memory,
+/// and little of it is free in the opening cutscene: in run c14 the pass
+/// over textures picked by index had 3.2 GB of staging buffers alive at
+/// once, for about a second (8,500 of them made in two), and 17 MB the
+/// second after. Made one by one, as before, they were too slow to pile
+/// up so.
+fn pieces_most() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mb = std::env::var("VICTORY_UPLOAD_PIECES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(1536) << 20
+    })
+}
+
+/// The blocks pieces are cut from (each an upload buffer and where it is
+/// mapped), what of them is free, and since when each wholly free one is.
+struct Pieces {
+    blocks: Vec<Option<(ID3D12Resource, usize)>>,
+    free: Ranges,
+    empty_since: Vec<Option<Instant>>,
+}
+
+static PIECES: Mutex<Pieces> = Mutex::new(Pieces {
+    blocks: Vec::new(),
+    free: Ranges {
+        by_size: BTreeSet::new(),
+        by_place: BTreeMap::new(),
+        free_in: Vec::new(),
+    },
+    empty_since: Vec::new(),
+});
+
+/// For the log: blocks of upload memory alive, pieces cut from them since
+/// the start, and the bytes of those alive now.
+pub(crate) static CUT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A mapped upload buffer for a staging buffer, from [`upload`].
+pub(crate) struct Upload {
+    pub(crate) buffer: ID3D12Resource,
+    /// Where the staging buffer's bytes start, mapped.
+    pub(crate) data: *mut u8,
+    /// Where they start in `buffer`.
+    pub(crate) origin: u64,
+    /// Its bytes: at least those asked for.
+    pub(crate) capacity: u64,
+    /// Whether it was used before: its bytes are then what its last user
+    /// left, not zeros.
+    pub(crate) used: bool,
+    /// The block and the place it was cut from, if it was.
+    pub(crate) piece: Option<(u32, u64)>,
+}
+
+/// A piece of `size` bytes or more of a block, or `None` (no memory).
+fn piece(host: &Host, size: u64) -> Option<Upload> {
+    let size = size.max(1).next_multiple_of(PIECE_GRAIN);
+    let cut = |pieces: &mut Pieces, block: u32, at: u64| {
+        if let Some(e) = pieces.empty_since.get_mut(block as usize) {
+            *e = None;
+        }
+        let (buffer, data) = pieces.blocks.get(block as usize)?.clone()?;
+        CUT[1].fetch_add(1, Relaxed);
+        CUT[2].fetch_add(size, Relaxed);
+        Some(Upload {
+            buffer,
+            data: (data + at as usize) as *mut u8,
+            origin: at,
+            capacity: size,
+            used: true,
+            piece: Some((block, at)),
+        })
+    };
+    {
+        let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((block, at)) = pieces.free.take(size) {
+            return cut(&mut pieces, block, at);
+        }
+    }
+    if CUT[0].load(Relaxed) * PIECE_BLOCK >= pieces_most() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                mb = pieces_most() >> 20,
+                "the blocks staging buffers are cut from hold all they may (VICTORY_UPLOAD_PIECES_MB): more staging \
+                 buffers are upload buffers of their own until pieces come back"
+            )
+        });
+        return None;
+    }
+    // Made with no lock held: other threads go on cutting meanwhile.
+    let (buffer, data) = host.upload_buffer(PIECE_BLOCK)?;
+    crate::host::name(&buffer, || "a block of upload memory staging buffers are cut from".into());
+    let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+    let block = match pieces.blocks.iter().position(Option::is_none) {
+        Some(i) => i,
+        None => {
+            pieces.blocks.push(None);
+            pieces.blocks.len() - 1
+        }
+    };
+    pieces.blocks[block] = Some((buffer, data as usize));
+    if pieces.empty_since.len() <= block {
+        pieces.empty_since.resize(block + 1, None);
+    }
+    CUT[0].fetch_add(1, Relaxed);
+    pieces.free.add(block as u32, 0, PIECE_BLOCK);
+    let (block, at) = pieces.free.take(size)?;
+    cut(&mut pieces, block, at)
+}
+
+/// Gives a piece back.
+fn piece_done(block: u32, at: u64, bytes: u64) {
+    let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+    CUT[2].fetch_sub(bytes, Relaxed);
+    if pieces.free.add(block, at, bytes) == PIECE_BLOCK
+        && let Some(e) = pieces.empty_since.get_mut(block as usize)
+    {
+        *e = Some(Instant::now());
+    }
+}
+
+/// Lets go of the blocks wholly free for `idle`, all but one.
+fn let_go_idle_pieces(idle: Duration) {
+    let mut gone = Vec::new();
+    {
+        let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+        let empty: Vec<usize> = (0..pieces.empty_since.len())
+            .filter(|&b| pieces.empty_since[b].is_some_and(|since| since.elapsed() >= idle))
+            .collect();
+        let wholly = pieces.free.by_size.range((PIECE_BLOCK, 0, 0)..).count();
+        for &b in empty.iter().take(wholly.saturating_sub(1)) {
+            if pieces.free.by_place.get(&(b as u32, 0)) == Some(&PIECE_BLOCK) {
+                pieces.free.remove(b as u32, 0);
+                pieces.empty_since[b] = None;
+                gone.extend(pieces.blocks[b].take());
+                CUT[0].fetch_sub(1, Relaxed);
+            }
+        }
+    }
+    drop(gone);
+}
+
+/// A mapped upload buffer of `size` bytes or more for a staging buffer.
+pub(crate) fn upload(host: &Host, size: u64) -> Option<Upload> {
+    if pieces_wanted() && size <= PIECE_LARGEST
+        && let Some(piece) = piece(host, size)
+    {
+        return Some(piece);
+    }
+    let whole = |buffer, data, capacity, used| Upload { buffer, data, origin: 0, capacity, used, piece: None };
     if spare_bytes() == 0 {
         let (buffer, data) = host.upload_buffer(size)?;
-        return Some((buffer, data, size, false));
+        return Some(whole(buffer, data, size, false));
     }
     let class = upload_class(size);
     let spare = {
@@ -307,16 +500,21 @@ pub(crate) fn upload(host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8,
     };
     if let Some(spare) = spare {
         UPLOADS[1].fetch_add(1, Relaxed);
-        return Some((spare.buffer, spare.data as *mut u8, class, true));
+        return Some(whole(spare.buffer, spare.data as *mut u8, class, true));
     }
     UPLOADS[0].fetch_add(1, Relaxed);
     let (buffer, data) = host.upload_buffer(class)?;
-    Some((buffer, data, class, false))
+    Some(whole(buffer, data, class, false))
 }
 
 /// An upload buffer of `bytes` bytes from [`upload`] that no list names any
-/// more: kept for the next one.
-pub(crate) fn upload_done(buffer: &ID3D12Resource, data: *mut u8, bytes: u64) {
+/// more: a piece is given back to its block, a whole buffer kept for the
+/// next one.
+pub(crate) fn upload_done(buffer: &ID3D12Resource, data: *mut u8, bytes: u64, piece: Option<(u32, u64)>) {
+    if let Some((block, at)) = piece {
+        piece_done(block, at, bytes);
+        return;
+    }
     if bytes != upload_class(bytes) {
         return;
     }
@@ -332,7 +530,9 @@ pub(crate) fn upload_done(buffer: &ID3D12Resource, data: *mut u8, bytes: u64) {
     });
 }
 
-/// Lets go of the spare upload buffers nothing took in ten seconds.
+/// Lets go of the spare upload buffers nothing took in ten seconds, and of
+/// the blocks pieces are cut from wholly free for [`PIECES_IDLE`] (all but
+/// one).
 pub(crate) fn let_go_idle() {
     const IDLE: Duration = Duration::from_secs(10);
     let mut gone = Vec::new();
@@ -348,6 +548,7 @@ pub(crate) fn let_go_idle() {
         spares.bytes -= bytes;
     }
     drop(gone);
+    let_go_idle_pieces(PIECES_IDLE);
 }
 
 #[cfg(test)]
@@ -399,6 +600,44 @@ mod tests {
         assert_eq!(r.take(100), Some((0, 0)));
         assert_eq!(r.take(100), Some((1, 0)));
         assert_eq!(r.take(1), None);
+    }
+
+    /// Pieces of a block of upload memory: each its own bytes, aligned for a
+    /// copy into a texture, and the block whole again when all are back.
+    #[test]
+    fn pieces_are_their_own_and_come_back() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let sizes = [1u64, 896, 4096, 70_000, 1 << 20, PIECE_LARGEST];
+        let taken: Vec<Upload> = sizes.iter().map(|&s| piece(host, s).expect("a piece")).collect();
+        for (i, (u, &size)) in taken.iter().zip(&sizes).enumerate() {
+            assert!(u.capacity >= size && u.origin.is_multiple_of(512), "{size}");
+            let (block, at) = u.piece.expect("cut from a block");
+            assert_eq!(at, u.origin);
+            // SAFETY: the piece's own mapped bytes.
+            unsafe { std::ptr::write_bytes(u.data, i as u8 + 1, u.capacity as usize) };
+            for o in &taken[..i] {
+                let (b, a) = o.piece.unwrap();
+                assert!(b != block || a + o.capacity <= at || at + u.capacity <= a, "pieces overlap");
+            }
+        }
+        for (i, u) in taken.iter().enumerate() {
+            // SAFETY: as above; no other piece wrote these bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(u.data, u.capacity as usize) };
+            assert!(bytes.iter().all(|&b| b == i as u8 + 1), "a piece written by another");
+        }
+        let back: Vec<(u32, u64, u64)> = taken.iter().map(|u| (u.piece.unwrap().0, u.origin, u.capacity)).collect();
+        for u in taken {
+            upload_done(&u.buffer, u.data, u.capacity, u.piece);
+        }
+        // Free again, joined with what is free beside them (other tests may
+        // hold pieces of the same blocks).
+        let pieces = PIECES.lock().unwrap();
+        for (b, at, len) in back {
+            let (&(fb, start), &free) = pieces.free.by_place.range(..=(b, at)).next_back().expect("a free range");
+            assert!(fb == b && start + free >= at + len, "piece at {at} of block {b} not free again");
+        }
     }
 
     #[test]

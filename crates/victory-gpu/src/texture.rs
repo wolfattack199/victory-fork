@@ -45,11 +45,16 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
-    /// The bytes of the upload buffer it is the start of (`crate::slabs`),
-    /// and whether what it holds is its own: a buffer that was used before
-    /// holds another texture until this one is first detiled into it.
+    /// The bytes of the upload buffer, or of the piece of one, it is the
+    /// start of (`crate::slabs`), and whether what it holds is its own: a
+    /// buffer that was used before holds another texture until this one is
+    /// first detiled into it.
     capacity: u64,
     own: std::sync::atomic::AtomicBool,
+    /// Where its bytes start in `buffer` (a piece cut from a block of upload
+    /// memory: the block and the place; else none, and 0).
+    origin: u64,
+    piece: Option<(u32, u64)>,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -404,6 +409,38 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a texture all of whose memory is mapped is copied out of title
+/// memory while the lock that keeps it mapped is held, and hashed and
+/// detiled from the copy after the lock is let go
+/// (`VICTORY_TEXTURE_SHORT_HOLD`: `1` on, `alt` in turn; off by default).
+///
+/// Why: read in place, the texture is hashed and detiled with the lock held
+/// (`crate::watch::title_memory_reading`), milliseconds for a large one,
+/// and every remapping of title memory waits for all such reads to end
+/// while every refresh that comes after it waits for the remapping. In the
+/// opening cutscene the title remaps some 2,000 times a frame: in run c9
+/// the submitting thread stood 12 % of its time in that lock's wait (a
+/// third of the time it was at work), and refreshes on all threads waited
+/// up to 864 ms a frame "for title memory to hold still".
+///
+/// With the switch the lock is held for a plain copy of the bytes (about
+/// 0.1 ms a megabyte), the same bytes a read in place would have seen: the
+/// picture cannot change by it.
+///
+/// Measured in run c10 (`alt`, the opening cutscene): no clear effect. The
+/// waits for title memory to hold still were small in that run with it and
+/// without (6 and 24 ms a frame on, 33 and 17 off), and the frame rate went
+/// with the scene (1.8 and 1.5 fps on, 2.7 and 7.5 off, in scenes of
+/// different weight). Hence off by default.
+fn short_hold() -> bool {
+    static SWITCH: crate::turns::Switch = crate::turns::Switch::new(
+        "VICTORY_TEXTURE_SHORT_HOLD",
+        false,
+        "textures are copied out of title memory under the mapping lock and detiled after it",
+    );
+    SWITCH.on()
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -424,7 +461,7 @@ impl Drop for Staging {
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Dropped by the last list that named it, after it ran.
-        crate::slabs::upload_done(&self.buffer, self.data, self.capacity);
+        crate::slabs::upload_done(&self.buffer, self.data, self.capacity, self.piece);
     }
 }
 
@@ -696,7 +733,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                         f.RowPitch
                     )
                 },
-                (gpu + footprint.Offset, len),
+                (gpu + staging.origin + footprint.Offset, len),
             );
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -711,8 +748,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            // The footprints are the staging buffer's own: where it starts in
+            // the upload buffer comes first.
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: staging.origin + footprint.Offset,
+                    Footprint: footprint.Footprint,
+                },
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -1050,6 +1092,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if short_hold() {
+                    drop(_mapped);
+                }
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1067,6 +1112,25 @@ impl Staging {
             }
             let _ = changed;
             return size;
+        }
+        if short_hold() {
+            return with_read(size, |read| {
+                // SAFETY: committed memory of the texture's layout size, and
+                // it stays committed while `_mapped` is held.
+                unsafe { std::ptr::copy_nonoverlapping(self.memory, read.as_mut_ptr(), size) };
+                drop(_mapped);
+                let hash = blake3::hash(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
@@ -1484,13 +1548,17 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, capacity, used) = crate::slabs::upload(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let crate::slabs::Upload { buffer, data, origin, capacity, used, piece } = crate::slabs::upload(host, total)?;
+    // (A piece's upload buffer holds others too: it keeps the name of its
+    // block.)
+    if piece.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1506,6 +1574,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         capacity,
         own: std::sync::atomic::AtomicBool::new(!used),
+        origin,
+        piece,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

@@ -16,19 +16,27 @@ This is a copy of [fxceless/victory-fork](https://github.com/fxceless/victory-fo
 (at `0b0074e`) with the changes below on top. Its aim is correct shaders and
 graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 
-| | State (2026-11-25) |
+| | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 852 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others |
+| Checks | 856 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others (one of them, `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset`, failed in one of two whole runs here and passed alone three times and in two runs of its crate) |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
+| Frame rate in the opening cutscene | **about 3.5 fps** (2026-11-26; about 2.0 before), the average of five runs of the same length (2.9 to 4.0). Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
 ### Working on right now
 
+- **Frame rate in the opening cutscene: 30 fps is the aim.** Since the change
+  below, our submitting thread is what the title waits for most: its render
+  thread stands 44 % of its time in the present call until that thread has
+  sent what came before, and the submitting thread is at work about two thirds
+  of the time (some 250-290 ms a frame: hashing, copies of title memory,
+  descriptor tables, textures), with no one part much larger than the others.
+  The card is busy only 25-36 % of the frame.
 - **Frame rate: 20 fps first, then 30.** Our submitting thread works about
   100 ms a frame: some 65 preparing (the descriptor tables the title wrote,
   refreshing copies of its buffers) and 35 sending about 125 MB up to the card,
@@ -50,13 +58,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene | not measured again | 9 % before | 2.7 fps then |
+| Frame rate in the opening cutscene, towards 20 fps | about 17 % | about 10 % before | measured: 2.86, 3.97, 3.72, 3.45 and 3.75 fps in five runs with staging buffers cut from blocks (c13-c16, c19), 3.55 on average; 1.58 to 2.61 in seven runs before it and 1.71 with it turned off (c17), about 2.0. Each run: the game started, the last 60 s of its first 75 s in the world measured |
+| Frame rate in the opening cutscene, towards 30 fps | about 12 % | about 7 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 88 % | 66 % before, at more draws | measured: 54 to 60 ms busy in the last four runs (35 to 49 the title's lists, 9 to 19 sending and hashing, 2 comparing) at 2,900 to 3,900 draws a frame; it was 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
-| Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections |
-| Runs that finish | 4 of the last 6 | new row | measured: 6 minute runs m28, m31, m32, m33 ran to the end (m33 is this update as pushed: 8.72 fps, median 107 ms, 2,881 draws a frame). m29 and m30 froze (the title then ends itself after about 30 s) with a test switch on, `VICTORY_BACK_OWN_VIEW=alt`, which the launcher never sets |
+| Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
+| Runs that finish | 12 of the last 12 short runs | 4 of 6 before | measured: the 75 s cutscene runs c8 to c19 ran to the end and closed cleanly |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -65,12 +74,51 @@ another PC.
 | Ray tracing | 0 % | | off. A stand-in for its indirect light (`VICTORY_AMBIENT`): a constant, less of it in creases and corners from the depth image. That is not ray tracing |
 
 The measured rows come from the first room on the PC below, with the Series S
-profile and the switches listed. The estimates are my own judgment, not
-measurements.
+profile and the switches listed, unless they name the cutscene. The estimates
+are my own judgment, not measurements.
 
-### New in this update
+### New in this update (2026-11-26): the opening cutscene at about 3.5 fps
 
-No clear frame rate gain this time (see the table above); what changed:
+| Runs (75 s each, the opening cutscene) | Staging buffers | fps |
+|---|---|---|
+| c3-c5, c7, c9, c11, c12 | one upload buffer each, as before | 2.22, 1.66, 1.69, 1.58, 2.23, 2.32, 2.61 |
+| c17 | the same (`VICTORY_UPLOAD_PIECES=0`) | 1.71 |
+| c13-c16, c19 | cut from blocks | 2.86, 3.97, 3.72, 3.45, 3.75 |
+
+- **What the frames waited for.** In the frames of 1 to 3.6 s the card stood
+  idle and our submitting thread was at work for less than half a second. A
+  sampler of what the title's threads wait on (stopped every 10 ms, the handle
+  read from the register Windows' wait keeps it in) showed the title's render
+  thread waiting for its five recording threads, and those making upload
+  buffers for new textures: each a new allocation of the driver's, mapped,
+  waiting for the card's paging of it. Frames of 1.8 to 2.4 s made 1,400 to
+  2,700 of them.
+- **Staging buffers are now cut from blocks of upload memory made once**
+  (`crates/victory-gpu/src/slabs.rs`, `VICTORY_UPLOAD_PIECES`, on; `=0` off,
+  `=alt` in turns). Blocks are 32 MB, a piece up to 8 MB, in steps of 4 KB; a
+  piece is given back when the last list that named it has run, and a block
+  that is wholly free for 2 s goes. Upload buffers made in a run went from
+  about 25,000 to about 50. In one burst the pass over textures picked by
+  index had 3.2 GB of staging buffers alive at once, so the blocks may hold
+  1.5 GB at most (`VICTORY_UPLOAD_PIECES_MB`); past that a staging buffer is an
+  upload buffer of its own, as before.
+- **`VICTORY_FRAME_RATE`** (31 to 240) lets the title's clock tick faster than
+  the 30 a second it asks for, for when frames are made faster than that.
+  Seen at 60 on the start screens; not tested in play yet.
+- Measured, no gain, off: the process's pages kept from Windows' trimming
+  (`VICTORY_KEEP_RESIDENT`, run c8: as many of the title's pages were out of
+  the working set with it as without); textures copied out of title memory
+  under the mapping lock and detiled after it (`VICTORY_TEXTURE_SHORT_HOLD`,
+  run c10); presents that return at once (`VICTORY_ASYNC_PRESENT`, run c6,
+  again no clear answer); more changed runs merged before flights are settled
+  (`VICTORY_MERGE_RUNS_WIDE`). `VICTORY_COPY_PROBE=1` is a measurement only: 1.5 to
+  23 % of the title's pages a copy reads were out of the working set first.
+- The runs set `VICTORY_AMBIENT=0.6` (at 0.2 faces went black in sunlit
+  scenes) and `VICTORY_MERGE_MASK=1`, besides the switches listed further down.
+
+### The update before (lighting stand-in, fewer waits at indirect clamps)
+
+No clear frame rate gain that time (see the table above); what changed:
 
 - **The stand-in for the ray traced light** (`crates/victory-gpu/src/ambient.rs`)
   is KomanderDG88's newer one (their fork, after Belobug's): less light in

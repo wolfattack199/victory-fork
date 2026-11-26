@@ -196,6 +196,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
+    probe(to, from, len);
     let whole = guarded(to, from, len);
     if whole {
         COUNT[0].fetch_add(1, Relaxed);
@@ -205,6 +206,75 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         note_fault(from as usize, len);
     }
     whole
+}
+
+/// With [`probe`]: copies looked at, and of their pages: looked at; at the
+/// source not in the working set, of them shared; at the destination not
+/// in it, of them shared; at the destination in it and write-combined.
+static PROBED: AtomicU64 = AtomicU64::new(0);
+static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Diagnostic (`VICTORY_COPY_PROBE=1`; off by default): before one copy in
+/// 16 of four pages or more, up to 32 of its 4 KiB pages, spread over it,
+/// are looked up in the working set at the source and at the destination.
+/// A page that is not in it costs the copy a fault (one Windows takes back
+/// from its lists, or a new page, or a read from the disk). In the opening
+/// cutscene of runs c3-c5 the frame's length followed its page faults
+/// (62,000 a long frame) as closely as the bytes copied (about 270 MB):
+/// this says on which side they are.
+fn probe(to: *mut u8, from: *const u8, len: usize) {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const K: usize = 4096;
+    const MOST: usize = 32;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COPY_PROBE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    if len < 4 * K || PROBED.fetch_add(1, Relaxed) % 16 != 0 {
+        return;
+    }
+    let pages = len / K;
+    let n = pages.min(MOST);
+    let step = pages / n;
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 2 * MOST] = unsafe { std::mem::zeroed() };
+    for i in 0..n {
+        info[i].VirtualAddress = ((from as usize + i * step * K) & !(K - 1)) as *mut _;
+        info[n + i].VirtualAddress = ((to as usize + i * step * K) & !(K - 1)) as *mut _;
+    }
+    // SAFETY: `2 * n` entries of the size given; our own process.
+    let asked = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            info.as_mut_ptr().cast(),
+            (2 * n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    if !asked {
+        return;
+    }
+    // Bit 0: in the working set; bit 15: shared; bits 4-14 (in it): the
+    // page's protection, 0x400 write-combined.
+    // SAFETY: plain data the query filled in.
+    let flags = |i: usize| unsafe { info[i].VirtualAttributes.Flags };
+    let mut c = [n as u64, 0, 0, 0, 0, 0];
+    for i in 0..n {
+        let (s, d) = (flags(i), flags(n + i));
+        if s & 1 == 0 {
+            c[1] += 1;
+            c[2] += u64::from(s & (1 << 15) != 0);
+        }
+        if d & 1 == 0 {
+            c[3] += 1;
+            c[4] += u64::from(d & (1 << 15) != 0);
+        } else if (d >> 4) & 0x400 != 0 {
+            c[5] += 1;
+        }
+    }
+    for (total, v) in PROBE.iter().zip(c) {
+        total.fetch_add(v, Relaxed);
+    }
 }
 
 /// [`copy`] for bytes the title asked to be copied, whatever their number:
@@ -245,6 +315,21 @@ pub(crate) fn line(frames: f64) {
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
         bytes / 1e6
     );
+    let p = PROBE.each_ref().map(|v| v.swap(0, Relaxed) as f64);
+    if p[0] > 0.0 {
+        let share = |a: f64, b: f64| if b > 0.0 { 100.0 * a / b } else { 0.0 };
+        tracing::info!(
+            "pages of copies in place looked up before the copy (VICTORY_COPY_PROBE=1), {:.0} a frame: not in the working set at the \
+             source {:.1} % ({:.0} % of those shared), at the destination {:.1} % ({:.0} % shared); of the destination's in it {:.1} % \
+             write-combined",
+            p[0] / frames,
+            share(p[1], p[0]),
+            share(p[2], p[1]),
+            share(p[3], p[0]),
+            share(p[4], p[3]),
+            share(p[5], p[0] - p[3])
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
