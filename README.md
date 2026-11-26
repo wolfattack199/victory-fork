@@ -19,7 +19,7 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 856 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others (one of them, `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset`, failed in one of two whole runs here and passed alone three times and in two runs of its crate) |
+| Checks | 857 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others (one of them, `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset`, failed in one of two whole runs here and passed alone three times and in two runs of its crate) |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
@@ -102,6 +102,16 @@ are my own judgment, not measurements.
   index had 3.2 GB of staging buffers alive at once, so the blocks may hold
   1.5 GB at most (`VICTORY_UPLOAD_PIECES_MB`); past that a staging buffer is an
   upload buffer of its own, as before.
+- **How much of a texture is there is asked of the kernel once for up to 256
+  of its 64 KB blocks**, not once a block (`mapped_bytes`): 27 against 33-38
+  microseconds a texture, 12.7 against 16-19 ms a frame of the pass over
+  textures picked by index (run c21; 3.42 fps, within the range above). Most
+  of what is left is the one-byte kernel reads of pages not in the working
+  set.
+- **Presents that return at once** (`VICTORY_ASYNC_PRESENT=1`, run c20): 3.72
+  fps, no gain, and a frame of 10.7 s in which the title's remapping of its
+  memory took 10.6 s (9,235 calls of about 1.1 ms; 10-25 microseconds is
+  usual). Off.
 - **`VICTORY_FRAME_RATE`** (31 to 240) lets the title's clock tick faster than
   the 30 a second it asks for, for when frames are made faster than that.
   Seen at 60 on the start screens; not tested in play yet.
@@ -110,7 +120,7 @@ are my own judgment, not measurements.
   the working set with it as without); textures copied out of title memory
   under the mapping lock and detiled after it (`VICTORY_TEXTURE_SHORT_HOLD`,
   run c10); presents that return at once (`VICTORY_ASYNC_PRESENT`, run c6,
-  again no clear answer); more changed runs merged before flights are settled
+  again no clear answer, and see above); more changed runs merged before flights are settled
   (`VICTORY_MERGE_RUNS_WIDE`). `VICTORY_COPY_PROBE=1` is a measurement only: 1.5 to
   23 % of the title's pages a copy reads were out of the working set first.
 - The runs set `VICTORY_AMBIENT=0.6` (at 0.2 faces went black in sunlit

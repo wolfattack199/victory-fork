@@ -1414,6 +1414,39 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+/// For each of `addrs`, in order: whether the kernel page that holds it can
+/// be read, as [`readable`] finds it (in the working set, or a one-byte read
+/// through the kernel succeeds); the pages are asked about together, up to
+/// 256 in one question.
+fn readable_each(addrs: &[usize], mut each: impl FnMut(usize, bool)) {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    for (c, chunk) in addrs.chunks(info.len()).enumerate() {
+        for (entry, &at) in info.iter_mut().zip(chunk) {
+            entry.VirtualAddress = (at & !(KERNEL_PAGE - 1)) as *mut _;
+        }
+        // SAFETY: `chunk.len()` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (chunk.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, &at) in chunk.iter().enumerate() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            let ok = valid || crate::host::read_into((at & !(KERNEL_PAGE - 1)) as *const u8, &mut byte);
+            each(c * info.len() + i, ok);
+        }
+    }
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
@@ -1471,15 +1504,27 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+        //
+        // The blocks' pages are asked about together, up to 256 in one
+        // question to the kernel: one question a block made this the
+        // largest part of that pass in the opening cutscene (run c19: 8 to
+        // 47 ms a frame, 30 to 60 microseconds a texture).
         const BLOCK: usize = 64 << 10;
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
+        let mut los = [0usize; 256];
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+            let n = (end - block).div_ceil(BLOCK).min(los.len());
+            for (i, lo) in los[..n].iter_mut().enumerate() {
+                *lo = (block + i * BLOCK).max(start);
             }
-            block = block.saturating_add(BLOCK);
+            readable_each(&los[..n], |i, ok| {
+                if ok {
+                    let hi = (block + (i + 1) * BLOCK).min(end);
+                    there += (hi - los[i]) as u64;
+                }
+            });
+            block = block.saturating_add(n * BLOCK);
         }
         return there;
     }
@@ -1712,6 +1757,49 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    /// The bytes found mapped by 64 KiB block, with the blocks' pages asked
+    /// about together, are those asked block by block: over more than 256
+    /// blocks, from and to the middle of one, some committed and touched,
+    /// some committed and never touched, some not committed.
+    #[test]
+    fn mapped_bytes_asked_together_as_block_by_block() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        const BLOCKS: usize = 300;
+        // SAFETY: a private reservation of the test's own, freed below;
+        // only committed pages are written.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), BLOCKS * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for b in 0..BLOCKS {
+                if b % 3 != 1 {
+                    let at = base.add(b * BLOCK);
+                    assert_eq!(VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                    if b % 3 == 0 {
+                        at.write(1);
+                    }
+                }
+            }
+            let by_block = |start: usize, len: usize| {
+                let end = start + len;
+                let (mut there, mut block) = (0u64, start & !(BLOCK - 1));
+                while block < end {
+                    let (lo, hi) = (block.max(start), (block + BLOCK).min(end));
+                    if readable(lo, 1, true).0 == 1 {
+                        there += (hi - lo) as u64;
+                    }
+                    block += BLOCK;
+                }
+                there
+            };
+            let b = base as usize;
+            for (start, len) in [(b, BLOCKS * BLOCK), (b + 100, BLOCKS * BLOCK - 5000), (b + 3 * BLOCK + 17, 270 * BLOCK), (b, 1), (b + BLOCK, 10)] {
+                assert_eq!(super::mapped_bytes(start as *const u8, len), by_block(start, len), "{:#x}+{len:#x}", start - b);
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 
     /// Both ways of asking: by page (the default) and by `VirtualQuery`.
