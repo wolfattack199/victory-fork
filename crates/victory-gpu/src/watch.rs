@@ -761,6 +761,80 @@ fn count(i: usize, n: u64) {
     GUARD_STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// For the log, since the last line: guard faults; of them, faults on a
+/// block that faulted in the frame before too, in this frame before, and
+/// two to four frames before. A block the title writes every frame pays a
+/// guard and a fault each frame, where copying it whole each time might
+/// cost less.
+pub(crate) static FAULT_AGAIN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The last fault of each block, as (block << 24 | frame), by the block's
+/// low bits: blocks that share a slot only make a repeat look new.
+static LAST_FAULT: [std::sync::atomic::AtomicU64; 1 << 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 1 << 16];
+
+/// The frame numbers [`LAST_FAULT`] keeps.
+const FRAME_BITS: u64 = 0xff_ffff;
+
+/// Notes a guard fault on `block` for [`FAULT_AGAIN`]. No allocation and
+/// no lock: it runs in the fault handler.
+fn fault_again(block: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::frame::current() & FRAME_BITS;
+    let was = LAST_FAULT[block & 0xffff].swap(((block as u64) << 24) | frame, Relaxed);
+    FAULT_AGAIN[0].fetch_add(1, Relaxed);
+    if was >> 24 != block as u64 || was == 0 {
+        return;
+    }
+    let before = frame.wrapping_sub(was & FRAME_BITS) & FRAME_BITS;
+    match before {
+        0 => FAULT_AGAIN[2].fetch_add(1, Relaxed),
+        1 => FAULT_AGAIN[1].fetch_add(1, Relaxed),
+        2..=4 => FAULT_AGAIN[3].fetch_add(1, Relaxed),
+        _ => 0,
+    };
+}
+
+/// For how many frames a block that took a guard fault is left open
+/// (`VICTORY_GUARD_HOT`; 0, the default, none, as before). Such a block is
+/// not made read-only again: every asking counts it written, so its copies
+/// take it whole each time, and no write to it can be missed. Once the
+/// frames are over the next asking guards it again.
+///
+/// Of the guard faults of run c51, 12 to 29 % were on a block that faulted
+/// in the frame before too, 3 to 30 % on one that faulted earlier in the
+/// same frame, 25 to 53 % on one that faulted two to four frames before:
+/// the title writes the same blocks frame after frame, and each time pays
+/// for making them read-only (about 35 µs a call, with the address
+/// space's lock that the title's remaps wait for) and for the fault that
+/// opens them again; a copy of 64 KiB is about 10 µs.
+fn hot_frames() -> u64 {
+    #[cfg(test)]
+    if let Some(frames) = tests::HOT.with(std::cell::Cell::get) {
+        return frames;
+    }
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Blocks left open by [`hot_frames`] at an asking, since the last line.
+pub(crate) static HOT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `block` took a guard fault in the last [`hot_frames`] frames
+/// (as [`LAST_FAULT`] has it: a block whose slot another took counts as
+/// not, and is guarded as before).
+fn hot(block: usize) -> bool {
+    let frames = hot_frames();
+    if frames == 0 {
+        return false;
+    }
+    let was = LAST_FAULT[block & 0xffff].load(std::sync::atomic::Ordering::Relaxed);
+    if was == 0 || was >> 24 != block as u64 {
+        return false;
+    }
+    let frame = crate::frame::current() & FRAME_BITS;
+    frame.wrapping_sub(was & FRAME_BITS) & FRAME_BITS < frames
+}
+
 fn count_us(i: usize, since: std::time::Instant) {
     count(i, since.elapsed().as_micros() as u64);
 }
@@ -1168,6 +1242,10 @@ fn guard_region(from: usize, to: usize, written: &mut Vec<usize>, uncommitted_un
                     if known & PROTECTED != 0 {
                         // Written through the runtime, still read-only.
                         BLOCKS.set(block, block + 1, CLEAN);
+                    } else if hot(block) {
+                        // Left open: counted written at every asking
+                        // while it is hot (the run before it is guarded).
+                        HOT_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         run.get_or_insert(block);
                         continue;
@@ -1859,6 +1937,7 @@ fn install() {
                 Err(need) => shards |= need,
                 Ok(true) => {
                     count(4, 1);
+                    fault_again(block);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     crate::framelog::add(crate::framelog::T::GuardFaults, 1);
@@ -2425,6 +2504,42 @@ mod tests {
         // SAFETY: the second view, read-write once the handler has opened it.
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    thread_local! {
+        /// [`hot_frames`] for the asking thread's checks, in place of
+        /// `VICTORY_GUARD_HOT` (other tests run beside on threads of their
+        /// own).
+        pub(super) static HOT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// With [`hot_frames`]: a block that took a guard fault is left open
+    /// and counts as written at every check while it is hot (frames do not
+    /// pass here), so a write to it without a fault is not missed; a block
+    /// that took none stays guarded. Once it is not hot, the next check
+    /// guards it again.
+    #[test]
+    fn a_block_that_faulted_lately_stays_open_and_counts_as_written() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        HOT.with(|h| h.set(Some(4)));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        // SAFETY: the guarded view, read-write once the handler has opened it.
+        unsafe { ((guarded + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        assert!(writable(guarded + BLOCK), "left open");
+        assert!(!writable(guarded), "the block that took no fault is guarded");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "written at every check");
+        // SAFETY: as above; open, so no fault.
+        unsafe { ((guarded + BLOCK + 9) as *mut u8).write(2) };
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        HOT.with(|h| h.set(None));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "guarded again");
+        assert!(!writable(guarded + BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }

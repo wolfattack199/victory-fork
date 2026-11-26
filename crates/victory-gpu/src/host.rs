@@ -9266,6 +9266,19 @@ impl Meter {
                 guards[8] / 1e3,
                 guards[9]
             );
+            let [faults, last, this, recent] = [0, 1, 2, 3].map(|i| crate::watch::FAULT_AGAIN[i].swap(0, Ordering::Relaxed));
+            if faults > 0 {
+                let share = |n: u64| 100.0 * n as f64 / faults as f64;
+                tracing::info!(
+                    "guard faults on blocks that faulted before: {faults} faults since the line before, {:.0} % on a block that \
+                     faulted in the frame before too, {:.0} % in the same frame before, {:.0} % two to four frames before; \
+                     blocks left open at an asking (VICTORY_GUARD_HOT): {:.0} a frame",
+                    share(last),
+                    share(this),
+                    share(recent),
+                    crate::watch::HOT_LEFT.swap(0, Ordering::Relaxed) as f64 / frames
+                );
+            }
             let [through, left, waited] = [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + waited > 0.0 {
                 tracing::info!(

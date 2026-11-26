@@ -19,7 +19,7 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 860 tests pass, 1 fails, 15 are ignored (2026-11-26, night). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before |
+| Checks | 862 tests pass, 1 fails, 15 are ignored (2026-11-26, morning; the graphics crate has one test more since, 286 of 286 in most runs). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. Some tests of the graphics crate fail in some runs and not in others, a different one each time: in 14 runs of the crate this morning, 3 had a failure and one stopped without a result, as noted before (`memory_that_is_no_view_is_not_written_behind`, `warp_a_fetch_through_the_copy_queue_brings_what_the_direct_queue_brings`, and in a run without this morning's last change `waits_end_on_ticks_and_count_frames` with `written_pages_are_reported_to_every_asker`); each passes run again. They share tables of views and sections with tests running beside them, which is the likely cause; not mended yet. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
@@ -70,7 +70,7 @@ another PC.
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 42 of the last 43 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c50 ran to the end and closed when asked, but in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 45 of the last 46 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c53 ran to the end and closed when asked, but in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -84,13 +84,14 @@ are my own judgment, not measurements.
 
 ### New in this update (2026-11-26, morning): where the long frames come from; switches measured, none adopted
 
-Nine cutscene runs since the update below (c42-c50): three usual ones (c42,
-c46 and c48, with Windows' memory counters read in c48) and six with a switch
-or a measurement on; and the full checks (862 pass; the one shader test that
+Twelve cutscene runs since the update below (c42-c53): four usual ones (c42,
+c46, c48 and c51, with Windows' memory counters read in c48) and eight with a
+switch or a measurement on; and the full checks (862 pass; the one shader test that
 failed before still fails). New in the code: the merge of what shaders wrote
 compares 32 bytes at a time, and two switches for measuring, off by default
-(`VICTORY_WRITE_PLAIN`, `VICTORY_GRAIN_SAMPLE`). Tests check the merge against
-the old loop and the plain write on a page that is not there.
+(`VICTORY_WRITE_PLAIN`, `VICTORY_GRAIN_SAMPLE`, `VICTORY_GUARD_HOT`). Tests
+check the merge against the old loop, the plain write on a page that is not
+there, and a block left open.
 
 - **Writing back what shaders wrote** (`crates/victory-gpu/src/shadow.rs`,
   `crates/victory-gpu/src/plaincopy.rs`). A thread of its own puts what
@@ -131,6 +132,19 @@ the old loop and the plain write on a page that is not there.
   Showing the pool's scattered pages to the card as tiles of one buffer is
   ruled out too: tile mappings into an opened heap remove the device (an
   earlier probe, `crates/victory-gpu/src/inplace.rs`).
+- **The guards find the same blocks frame after frame.** A count in the
+  fault handler (`crates/victory-gpu/src/watch.rs`, always on, a line in
+  the log): of the guard faults of c51, 12 to 29 % were on a block that
+  faulted in the frame before too, 3 to 30 % on one that faulted earlier in
+  the same frame, 25 to 53 % on one that faulted two to four frames before.
+- **Blocks that faulted lately left open** (`VICTORY_GUARD_HOT=4`, off by
+  default; a test checks that such a block counts as written at every
+  check, so no write is missed): no gain. A block left open is copied at
+  every asking, many a frame: 431 and 465 MB copied a frame against 174
+  (c52, c53 against c51), and faults fell little, since guarding another
+  view of the same page makes it read-only again. 3.50 and 2.61 fps against
+  3.50. The title's remaps were fast in c52 (60 µs a call) and slow in c53
+  (319): what they cost goes with the scene, not with this.
 - **A lost device in c46.** About two minutes in, the driver reported a
   fault in a shader on the card ("Graphics SM Global Exception … Multiple
   Warp Errors"), and the device was lost (0x887A0006) while the submitting
