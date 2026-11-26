@@ -278,6 +278,12 @@ static SPARES: Mutex<Spares> = Mutex::new(Spares {
 /// For the log: upload buffers made, and used again, since the start.
 pub(crate) static UPLOADS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// For the log, since the start: staging buffers that were no piece of a
+/// block, and their bytes, because they are larger than [`PIECE_LARGEST`];
+/// and because no piece was had (the blocks held all they may, or the
+/// host made no block).
+pub(crate) static OWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// The bytes of spare upload buffers kept (`VICTORY_STAGING_POOL_MB`, 384;
 /// 0: none).
 fn spare_bytes() -> u64 {
@@ -519,10 +525,16 @@ const PIECES_KEPT_IDLE: Duration = Duration::from_secs(20);
 
 /// A mapped upload buffer of `size` bytes or more for a staging buffer.
 pub(crate) fn upload(host: &Host, size: u64) -> Option<Upload> {
-    if pieces_wanted() && size <= PIECE_LARGEST
-        && let Some(piece) = piece(host, size)
-    {
-        return Some(piece);
+    if pieces_wanted() {
+        if size > PIECE_LARGEST {
+            OWN[0].fetch_add(1, Relaxed);
+            OWN[1].fetch_add(size, Relaxed);
+        } else if let Some(piece) = piece(host, size) {
+            return Some(piece);
+        } else {
+            OWN[2].fetch_add(1, Relaxed);
+            OWN[3].fetch_add(size, Relaxed);
+        }
     }
     let whole = |buffer, data, capacity, used| Upload { buffer, data, origin: 0, capacity, used, piece: None };
     if spare_bytes() == 0 {

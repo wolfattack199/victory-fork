@@ -63,14 +63,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 24 % | no clear change | measured: 4.67 and 4.28 fps in the two usual runs since (c42, c48; the others had switches on for measuring, see the newest update); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
-| Frame rate in the opening cutscene, towards 30 fps | about 16 % | about 13 % before | the same runs |
+| Frame rate in the opening cutscene, towards 20 fps | about 23 % | 24 % before: the usual runs since are lower, 3.98 fps on average, 4.57 over all fourteen | measured: 4.67, 4.28, 3.50 and 3.47 fps in the four usual runs since (c42, c48, c51, c58; the others had switches on for measuring, see the newest update); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 30 fps | about 15 % | 16 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 44 to 53 ms busy in c32-c34, c36 and c37 (30 to 36 the title's lists, 13 to 17 sending and hashing, 1 to 1.5 comparing) at 2,700 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 45 of the last 46 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c53 ran to the end and closed when asked, but in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 49 of the last 51 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c58 ran to the end and closed when asked, except c55, where the title stopped on a breakpoint of its own while loading (see the newest update below); and in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -84,9 +84,9 @@ are my own judgment, not measurements.
 
 ### New in this update (2026-11-26, morning): where the long frames come from; switches measured, none adopted
 
-Twelve cutscene runs since the update below (c42-c53): four usual ones (c42,
-c46, c48 and c51, with Windows' memory counters read in c48) and eight with a
-switch or a measurement on; and the full checks (862 pass; the one shader test that
+Seventeen cutscene runs since the update below (c42-c58): five usual ones (c42,
+c46, c48, c51 and c58, with Windows' memory counters read in c48) and twelve
+with a switch, a measurement or a profiler on; and the full checks (862 pass; the one shader test that
 failed before still fails). New in the code: the merge of what shaders wrote
 compares 32 bytes at a time, and two switches for measuring, off by default
 (`VICTORY_WRITE_PLAIN`, `VICTORY_GRAIN_SAMPLE`, `VICTORY_GUARD_HOT`). Tests
@@ -145,6 +145,34 @@ there, and a block left open.
   view of the same page makes it read-only again. 3.50 and 2.61 fps against
   3.50. The title's remaps were fast in c52 (60 µs a call) and slow in c53
   (319): what they cost goes with the scene, not with this.
+- **Six helper threads instead of four** (`VICTORY_WIDE_THREADS=6`; the
+  runs set 4): 5.22 fps in c54, 3.79 in c56, within what runs differ by; the
+  guards' wait for one another doubled (24 to 27 ms a frame against 9 to 14).
+  Not adopted. In c55, with the same setting, the title stopped on a
+  breakpoint of its own while loading, before the world (exception
+  0x80000003 just after a call it takes for one that does not return):
+  the first such stop in any run log here. Not understood; it may have
+  nothing to do with the setting.
+- **Where a frame could go without copies.** The ray tracing work has a
+  directory with an entry for every 64 KiB of title memory, through which
+  translated shaders read and write by address. Pointed at the title's pool
+  of physical pages (a committed section can be opened as a heap; a reserved
+  one, as made today, cannot), and used by every shader, it would leave out
+  the copies, the guards and the writing back that fill most of the
+  submitting thread's frame. That is a large change to the translator and
+  the layer, with the card then reading the PC's memory over the bus; not
+  begun.
+- **Staging memory in bursts** (a new log line, `crates/victory-gpu/src/slabs.rs`).
+  A profile of c57 found one of the title's threads 41 % of the time in the
+  kernel, mapping an upload buffer made for one texture's staging. Counted in
+  c58: 2,785 staging buffers (1,121 MB) were made one by one because the
+  blocks they are cut from held all they may (1,536 MB), nearly all in two
+  bursts of a few seconds (at the world's start, and a minute later), and 216
+  (about 2 GB) because they were larger than a piece may be (8 MB). Between
+  the bursts some 50 MB of the blocks are in use; the blocks were made 208
+  times in the run (26 ms each), let go after the bursts and made again at
+  the next. Not changed yet: more blocks kept, or a higher cap, is more of
+  the PC's memory, which is short already.
 - **A lost device in c46.** About two minutes in, the driver reported a
   fault in a shader on the card ("Graphics SM Global Exception … Multiple
   Warp Errors"), and the device was lost (0x887A0006) while the submitting

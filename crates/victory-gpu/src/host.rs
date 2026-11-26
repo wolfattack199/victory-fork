@@ -9239,6 +9239,15 @@ impl Meter {
             let (free, resting, whole) = crate::slabs::free_bytes();
             let [cut_blocks, cut, cut_bytes] = [0, 1, 2].map(|i| crate::slabs::CUT[i].load(Ordering::Relaxed));
             let [blocks_made, making_us] = [0, 1].map(|i| crate::slabs::BLOCKS_MADE[i].load(Ordering::Relaxed));
+            let own: [u64; 4] = std::array::from_fn(|i| crate::slabs::OWN[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "staging buffers that were no piece of a block of upload memory, since the start: {} larger than a piece may be \
+                 ({} MB), {} for want of a piece ({} MB)",
+                own[0],
+                own[1] >> 20,
+                own[2],
+                own[3] >> 20
+            );
             tracing::info!(
                 "textures placed in blocks of the card's memory: {placed} since the start, {blocks} blocks of 64 MB, of their \
                  bytes {} MB free ({whole} blocks wholly) and {} MB resting; upload buffers made {made}, used again {again}; \
