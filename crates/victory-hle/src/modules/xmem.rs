@@ -157,6 +157,14 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // Renderer port 1: the title's 32-bit graphics reservations, whose
+    // pages [`arrange`] puts in address order. (The title asks for its
+    // 32-bit heap with kind 0x42000, without the 64 KiB page bits: not
+    // `placeholder` above, though the host makes a placeholder of it all
+    // the same.)
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 && port_on() {
+        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    }
     if !at.is_null() && kind & MEM_RESERVE != 0 {
         // A placeholder only views of physical pages fill: the GPU side
         // answers how much of a texture there is mapped from the views it
@@ -368,8 +376,25 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// A section for physical pages, and whether it was made committed whole.
-struct Section(HANDLE, bool);
+/// A section for physical pages: its handle, whether it was made committed
+/// whole, its pages, and a bit per page set once a view showed it (renderer
+/// port 1's [`arrange`] moves only pages never shown, whose bytes are still
+/// zeros and which the title cannot tell apart).
+struct Section(HANDLE, bool, usize, Box<[AtomicU64]>);
+
+impl Section {
+    /// Pages `[index, index + n)` are shown by a view from now on.
+    fn shown(&self, index: usize, n: usize) {
+        for i in index..(index + n).min(self.2) {
+            self.3[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
+        }
+    }
+
+    /// Whether page `index` was never shown by a view.
+    fn fresh(&self, index: usize) -> bool {
+        index < self.2 && self.3[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -654,7 +679,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, committed);
-    let section = Arc::new(Section(handle, committed));
+    let section = Arc::new(Section(handle, committed, n, (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()));
     let first = {
         let mut physical = physical();
         let first = physical.next_page;
@@ -715,6 +740,7 @@ impl View {
     /// `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        slice.section.shown(slice.index, n);
         if kept_views()
             && let Some((at, kept)) = victory_gpu::title_section_view(slice.section.0 as usize, offset, len)
         {
@@ -903,6 +929,103 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
 }
 
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`, off by default; the GPU
+/// side's half is `victory_gpu`'s `port`). Brought over from the
+/// VIctory-7900XTX fork (its commits 86dc1097, 4b82f6c2, 9c23e8dd), read
+/// line by line and fitted to this page table.
+fn port_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// The title's reservations for 32-bit graphics memory: base and bytes
+/// (one, of 185 MB, in this title).
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Pages given another place in their section so far by [`arrange`], and
+/// the times it found a page that was not fresh.
+static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Before `pages` are mapped at `base`: if `base` lies in a 32-bit graphics
+/// reservation ([`LOW_RESERVATIONS`]) and the pages are of one section at
+/// least as big, the page numbers are given the slices of that section in
+/// the reservation's address order (each page at its offset in the
+/// reservation), so that the reservation becomes one stretch of the section
+/// and the GPU side can open it as one heap.
+///
+/// The title takes all the pages of its 185 MB heap in one call and maps
+/// its five pieces in another order than their addresses (the fork's run
+/// port1-1: "Scattered"). Only fresh slices are exchanged: never shown by
+/// a view, so every one still reads as zeros and which slice a number names
+/// is not observable by the title.
+fn arrange(base: usize, pages: &[usize]) {
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+    else {
+        return;
+    };
+    let mut table = known_pages_mut();
+    let Some(section) = pages.first().and_then(|p| table.get(p)).map(|s| s.section.clone()) else {
+        return;
+    };
+    if section.2 * PAGE < bytes || !pages.iter().all(|p| table.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section))) {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                pages = pages.len(),
+                section_pages = section.2,
+                reservation = bytes / PAGE,
+                "renderer port 1: pages mapped into the 32-bit heap are not of one section as big as it: left where they are"
+            );
+        }
+        return;
+    }
+    // Which number has which slice of the section.
+    let mut owner: HashMap<usize, usize> =
+        table.iter().filter(|(_, s)| Arc::ptr_eq(&s.section, &section)).map(|(&number, s)| (s.index, number)).collect();
+    let mut moved = 0u64;
+    for (i, number) in pages.iter().enumerate() {
+        let want = (base - first) / PAGE + i;
+        let Some(have) = table.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if !section.fresh(have) || !section.fresh(want) {
+            ARRANGED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if let Some(other) = owner.get(&want).copied()
+            && let Some(slice) = table.get_mut(&other)
+        {
+            slice.index = have;
+            owner.insert(have, other);
+        }
+        if let Some(slice) = table.get_mut(number) {
+            slice.index = want;
+        }
+        owner.insert(want, *number);
+        moved += 1;
+    }
+    if moved > 0 {
+        let all = ARRANGED[0].fetch_add(moved, Ordering::Relaxed) + moved;
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            all,
+            not_fresh = ARRANGED[1].load(Ordering::Relaxed),
+            "renderer port 1: the title's 32-bit graphics pages given their section's slices in address order"
+        );
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -911,6 +1034,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    if port_on() && !pages.is_null() && n > 0 {
+        // SAFETY: the title passes `n` page numbers.
+        arrange(base, unsafe { std::slice::from_raw_parts(pages, n) });
+    }
     let called = std::time::Instant::now();
     let _counted = Counted(called);
     // Until the locks below are let go: declared first, dropped last.
@@ -1122,6 +1249,7 @@ fn map_rest(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
 }
 
 fn map_view(physical: &mut Physical, base: usize, len: usize, slice: Slice, log: bool) -> bool {
+    slice.section.shown(slice.index, len.div_ceil(PAGE));
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1552,6 +1680,39 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    /// Renderer port 1: pages mapped into a 32-bit reservation piece by
+    /// piece, in another order than their addresses, get their section's
+    /// slices in address order; a page once shown keeps its slice.
+    #[test]
+    fn the_32_bit_heap_gets_its_slices_in_address_order() {
+        // As the title reserves it: kind 0x42000 (reserve and 0x40000), no
+        // 64 KiB page bits, graphics memory below 4 GiB.
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        // (The switch is off in tests: the reservation is recorded here.)
+        LOW_RESERVATIONS.lock().unwrap().push((base as usize, 4 * PAGE));
+        let pages = allocate(4);
+        let index = |number: usize| known_pages().get(&number).map(|s| s.index);
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        // The last two pages' place first, from the array's start.
+        arrange(at(2) as usize, &pages[..2]);
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        arrange(base as usize, &pages[2..]);
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages[2..].as_ptr()), base);
+        assert_eq!([index(pages[0]), index(pages[1]), index(pages[2]), index(pages[3])], [Some(2), Some(3), Some(0), Some(1)]);
+        // Shown already: nothing moves any more.
+        arrange(base as usize, &pages[..2]);
+        assert_eq!(index(pages[0]), Some(2));
+        // The bytes written at an address are the page's, wherever else it
+        // is shown.
+        // SAFETY: mapped read-write.
+        unsafe { at(3).cast::<u32>().write(7) };
+        assert_eq!(page_bytes(pages[1])[..4], 7u32.to_le_bytes(), "page 1 is shown at the fourth address");
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        LOW_RESERVATIONS.lock().unwrap().retain(|r| r.0 != base as usize);
     }
 
     #[test]

@@ -55,6 +55,8 @@ mod ambient;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -94,7 +96,7 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, recent_draws};
 #[cfg(windows)]
 pub use behind::{TitleSectionView, title_section_view};
 #[cfg(windows)]

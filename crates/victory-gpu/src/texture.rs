@@ -93,7 +93,32 @@ struct Last {
     /// they were found guarded and unwritten: as long as they are these,
     /// nothing happened to the texture.
     quiet: Option<u64>,
+    /// Levels on demand: the levels held at the last detiling and the hash
+    /// of their bytes ([`Staging::held_unchanged`]).
+    held: Option<(u32, blake3::Hash)>,
 }
+
+/// Whether a texture with levels on demand is detiled again only if the
+/// levels it holds, or their bytes, changed (`VICTORY_TEXTURE_HELD_ONLY=1`;
+/// off until measured).
+///
+/// Why: a level not all of whose pages are mapped is detiled as zeros, yet
+/// whether to detile was asked of a hash of all of the texture's memory. A
+/// page streamed into such a level changed that hash, and the whole texture
+/// was detiled and sent to the card again, its held levels as they were and
+/// the rest zeros as before. In the opening cutscene (run c68) 50 to 167 MB
+/// a frame were detiled through the path for partly mapped textures, nearly
+/// all of them textures detiled before, while of the 1,829 textures with
+/// levels on demand alive only 7 levels were held in all. What a detiling
+/// gives is the held levels and their bytes; when both are as at the last
+/// one, it would give the same.
+fn held_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HELD_ONLY").is_some_and(|v| v == "1"))
+}
+
+/// For the log: detilings passed over by [`held_only`], and their bytes.
+pub(crate) static HELD_SKIPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -965,6 +990,64 @@ impl Staging {
         held
     }
 
+    /// Levels on demand: the levels held now ([`Staging::held_levels`]) and
+    /// a hash of the bytes of `tiled` (the texture's memory as read) that
+    /// lie in them; `None` for a texture whose levels this cannot tell (all
+    /// held) or without levels on demand.
+    fn held_key(&self, tiled: &[u8], judged: [u64; 2]) -> Option<(u32, blake3::Hash)> {
+        if !self.on_demand {
+            return None;
+        }
+        let held = self.held_levels(judged);
+        if held == u32::MAX {
+            return None;
+        }
+        let mips = &self.layout.mips;
+        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&held.to_le_bytes());
+        let mut take = |from: u64, to: u64| {
+            let (from, to) = (from as usize, (to as usize).min(tiled.len()));
+            if from < to {
+                hasher.update(&tiled[from..to]);
+            }
+        };
+        for (level, m) in mips.iter().enumerate().take(tail) {
+            if held & (1 << level) != 0 {
+                let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
+                take(m.offset, end);
+            }
+        }
+        if tail < mips.len() && (tail..mips.len()).any(|level| held & (1 << level) != 0) {
+            take(0, self.layout.alignment.min(self.layout.slice_size));
+        }
+        Some((held, hasher.finalize()))
+    }
+
+    /// With [`held_only`]: whether detiling `tiled` now would give what the
+    /// last detiling gave (the same levels held, their bytes the same), so
+    /// that it is passed over. Notes what it found for the next time.
+    fn held_unchanged(&self, last: &mut Last, tiled: &[u8]) -> bool {
+        if !held_only() || !self.on_demand || !self.own.load(std::sync::atomic::Ordering::Relaxed) {
+            last.held = None;
+            return false;
+        }
+        let judged = self.judgement();
+        let key = self.held_key(tiled, judged);
+        if key.is_some() && last.held == key {
+            use std::sync::atomic::Ordering::Relaxed;
+            // What the detiling would have judged, as it would have kept it
+            // (the same levels held): the upload looks for a change of it.
+            self.judged[0].store(judged[0], Relaxed);
+            self.judged[1].store(judged[1], Relaxed);
+            HELD_SKIPS[0].fetch_add(1, Relaxed);
+            HELD_SKIPS[1].fetch_add(tiled.len() as u64, Relaxed);
+            return true;
+        }
+        last.held = key;
+        false
+    }
+
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
@@ -1025,7 +1108,10 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                if !self.held_unchanged(last, read) {
+                    changes::from(0);
+                    self.detile(read);
+                }
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1083,8 +1169,14 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             // (And at most about half a second: 30 frames were four seconds
             // where the title begins eight a second.)
+            // `VICTORY_PARTIAL_MS` sets the half second, for measuring what
+            // the reading costs (run c71).
+            static PARTIAL_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+                std::env::var("VICTORY_PARTIAL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+            });
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + crate::frame::frames_in(500, 30)) {
+            let most = if *PARTIAL_MS > 500 { u64::MAX } else { 30 };
+            if last.partial.is_some_and(|at| frame < at + crate::frame::frames_in(*PARTIAL_MS, most)) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1103,7 +1195,10 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                if !self.held_unchanged(last, read) {
+                    changes::from(1);
+                    self.detile(read);
+                }
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1126,7 +1221,10 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(read);
+                if !self.held_unchanged(last, read) {
+                    changes::from(2);
+                    self.detile(read);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1141,7 +1239,10 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                if !self.held_unchanged(last, tiled) {
+                    changes::from(3);
+                    self.detile(tiled);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1157,7 +1258,10 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        if !self.held_unchanged(last, tiled) {
+            changes::from(4);
+            self.detile(tiled);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1179,7 +1283,10 @@ impl Staging {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                if !self.held_unchanged(last, read) {
+                    changes::from(5);
+                    self.detile(read);
+                }
             }
             true
         });
@@ -1199,6 +1306,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        changes::note(self.memory as usize, &self.layout.desc, tiled.len() as u64);
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1716,6 +1824,146 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Which textures of title memory change, for measuring
+/// (`VICTORY_TEXTURE_CHANGES=1`, off): every detiling of a texture's memory
+/// (its bytes changed, or it was refreshed for the first time) is counted
+/// by its address, and every ten seconds the textures that were detiled for
+/// the most bytes are logged with their size and how often, then counted
+/// anew. In the opening cutscene 82 to 93 % of the 110 to 264 MB of texture
+/// memory hashed a frame had changed (run c63): this says which textures.
+mod changes {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    use victory_formats::texture::Desc;
+
+    /// By address: detilings, bytes, and the texture's description; bytes
+    /// by the refresh's path ([`from`]) and whether the address was ever
+    /// detiled before (first, again); every address ever detiled.
+    struct Seen {
+        since: Option<Instant>,
+        frames: u64,
+        by_address: Option<HashMap<usize, (u64, u64, Desc)>>,
+        by_path: [[u64; 2]; 7],
+        ever: Option<std::collections::HashSet<usize>>,
+    }
+
+    static SEEN: Mutex<Seen> =
+        Mutex::new(Seen { since: None, frames: 0, by_address: None, by_path: [[0; 2]; 7], ever: None });
+
+    /// The paths of a refresh to a detiling: 0 written pages found, 1
+    /// partly mapped (read again), 2 to 4 hashed (held briefly, through the
+    /// copy, in place), 5 read through the kernel while remapping; 6 none
+    /// said.
+    const PATHS: [&str; 7] =
+        ["written pages", "partly mapped", "hashed (short hold)", "hashed (through the copy)", "hashed", "through the kernel", "other"];
+
+    thread_local! {
+        static PATH: std::cell::Cell<u8> = const { std::cell::Cell::new(6) };
+    }
+
+    /// The path of the detiling that follows on this thread.
+    pub(super) fn from(path: u8) {
+        if on() {
+            PATH.with(|p| p.set(path));
+        }
+    }
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGES").is_some_and(|v| v == "1"))
+    }
+
+    pub(super) fn note(address: usize, desc: &Desc, bytes: u64) {
+        if !on() {
+            return;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        let since = *seen.since.get_or_insert_with(Instant::now);
+        if seen.frames == 0 {
+            seen.frames = frame;
+        }
+        let path = PATH.with(|p| p.replace(6)).min(6) as usize;
+        let again = !seen.ever.get_or_insert_with(Default::default).insert(address);
+        seen.by_path[path][usize::from(again)] += bytes;
+        let entry = seen.by_address.get_or_insert_with(HashMap::new).entry(address).or_insert((0, 0, *desc));
+        entry.0 += 1;
+        entry.1 += bytes;
+        entry.2 = *desc;
+        if since.elapsed().as_secs() < 10 {
+            return;
+        }
+        let frames = frame.saturating_sub(seen.frames).max(1);
+        let mut all: Vec<(usize, (u64, u64, Desc))> = seen.by_address.take().unwrap_or_default().into_iter().collect();
+        let by_path = std::mem::take(&mut seen.by_path);
+        seen.since = Some(Instant::now());
+        seen.frames = frame;
+        drop(seen);
+        all.sort_by_key(|&(_, (_, bytes, _))| std::cmp::Reverse(bytes));
+        let total: u64 = all.iter().map(|(_, (_, b, _))| b).sum();
+        let mb = |b: u64| b as f64 / (1 << 20) as f64;
+        // By size and shape: how many textures of each changed, and their bytes.
+        let mut shapes: HashMap<(u32, u32, u32, u32, u32), (u64, u64, u64)> = HashMap::new();
+        for (_, (n, b, d)) in &all {
+            let s = shapes.entry((d.width, d.height, d.depth, d.element_bytes, d.block)).or_default();
+            s.0 += 1;
+            s.1 += n;
+            s.2 += b;
+        }
+        let mut shapes: Vec<_> = shapes.into_iter().collect();
+        shapes.sort_by_key(|&(_, (_, _, b))| std::cmp::Reverse(b));
+        let top: Vec<String> = all
+            .iter()
+            .take(10)
+            .map(|(at, (n, b, d))| {
+                format!(
+                    "{at:#x} {}x{}x{} {} B/elem block {} mips {}: {n}x {:.1} MB",
+                    d.width,
+                    d.height,
+                    d.depth,
+                    d.element_bytes,
+                    d.block,
+                    d.mips,
+                    mb(*b)
+                )
+            })
+            .collect();
+        let by_shape: Vec<String> = shapes
+            .iter()
+            .take(10)
+            .map(|((w, h, z, e, k), (t, n, b))| format!("{w}x{h}x{z} {e} B/elem block {k}: {t} textures {n}x {:.1} MB", mb(*b)))
+            .collect();
+        let paths: Vec<String> = by_path
+            .iter()
+            .zip(PATHS)
+            .filter(|(b, _)| b[0] + b[1] > 0)
+            .map(|(b, name)| {
+                format!("{name} {:.1} MB ({:.1} of textures never detiled before)", mb(b[0] + b[1]) / frames as f64, mb(b[0]) / frames as f64)
+            })
+            .collect();
+        // Detilings passed over since the line before (`held_only`).
+        static SKIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let skipped: Vec<u64> = (0..2)
+            .map(|i| {
+                let now = super::HELD_SKIPS[i].load(std::sync::atomic::Ordering::Relaxed);
+                now - SKIPPED[i].swap(now, std::sync::atomic::Ordering::Relaxed)
+            })
+            .collect();
+        tracing::info!(
+            "texture memory detiled per frame (VICTORY_TEXTURE_CHANGES): {:.1} MB in {} textures over {frames} frames; passed over, the held levels and their bytes as before (VICTORY_TEXTURE_HELD_ONLY): {:.1} a frame, {:.1} MB; by path, per frame: {}; most, over those frames: {}; by shape, over those frames: {}",
+            mb(total) / frames as f64,
+            all.len(),
+            skipped[0] as f64 / frames as f64,
+            mb(skipped[1]) / frames as f64,
+            paths.join(", "),
+            top.join("; "),
+            by_shape.join("; ")
+        );
+    }
 }
 
 #[cfg(test)]

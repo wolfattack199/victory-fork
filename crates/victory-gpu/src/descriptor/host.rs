@@ -470,7 +470,13 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A span shorter than its head has nothing after it (and a range
+        // whose start lies past its end panics).
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -3971,6 +3977,19 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// A texture written where another starts replaces it: at the same
     /// address with another length, or inside the block of its smallest
     /// levels. The packed neighbours of the one replaced stay.
+    /// The next texture after one shorter than [`HEAD`]: none, not a panic
+    /// (the range asked of the map would start past its end).
+    #[test]
+    fn a_span_shorter_than_its_head_has_no_next_start() {
+        let mut spans = Spans::default();
+        let at = 0x7_0000_0000u64;
+        assert!(spans.note(1, at + 0x800, at + 0x1800, true).is_empty());
+        assert_eq!(spans.next_start(at, at + 0x800), None);
+        assert_eq!(spans.next_start(at, at + HEAD), None);
+        assert_eq!(spans.next_start(at, at + 0x10000), None, "within the head");
+        assert_eq!(spans.next_start(at - HEAD, at + 0x10000), Some(at + 0x800));
+    }
+
     #[test]
     fn a_texture_written_at_the_start_of_another_replaces_it() {
         let mut spans = Spans::default();

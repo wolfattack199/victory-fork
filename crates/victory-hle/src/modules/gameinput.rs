@@ -1250,6 +1250,11 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            // `VICTORY_AUTO_START`: Enter, as the test script pressed it,
+            // with or without focus.
+            if super::auto_start(Instant::now()) && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1491,12 +1496,97 @@ mod host {
     }
 }
 
+/// `VICTORY_AUTO_START=1` (off by default; for unattended test runs): the
+/// runtime holds Enter at the title's start screen, as the test script
+/// pressed it there, but without the window in front (the keyboard and the
+/// stand-in pad both see it; A on the pad alone did not leave the start
+/// screen in run c75). The script's key
+/// presses are skipped while another program is in front, and Windows keeps
+/// the game from coming forward while someone types elsewhere: run c74
+/// never left the start screen.
+fn auto_start(now: Instant) -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_AUTO_START").is_some_and(|v| v == "1"));
+    static PRESSES: Mutex<Option<Presses>> = Mutex::new(None);
+    if !*ON {
+        return false;
+    }
+    let mut presses = lock(&PRESSES);
+    let presses = presses.get_or_insert_with(|| Presses::new(now));
+    let (held, new) = presses.at(now, victory_gpu::recent_draws());
+    if new {
+        tracing::info!(press = presses.done, "VICTORY_AUTO_START: Enter pressed at the start screen");
+    }
+    held
+}
+
+/// When [`auto_start`] holds Enter: from [`Presses::AFTER`] after the first
+/// poll, while the title draws as its start screen does (4 to 11 things a
+/// frame, at most [`Presses::SCREEN`]), for [`Presses::HOLD`] every
+/// [`Presses::EVERY`], at most [`Presses::MOST`] times. Never while the
+/// world draws, where a press could skip the opening cutscene.
+struct Presses {
+    first: Instant,
+    last: Option<Instant>,
+    done: u8,
+}
+
+impl Presses {
+    const AFTER: Duration = Duration::from_secs(32);
+    const EVERY: Duration = Duration::from_secs(4);
+    const HOLD: Duration = Duration::from_millis(200);
+    const MOST: u8 = 4;
+    const SCREEN: u32 = 20;
+
+    fn new(first: Instant) -> Presses {
+        Presses { first, last: None, done: 0 }
+    }
+
+    /// Whether Enter is held at `now` with the title drawing `draws` a frame,
+    /// and whether a press began.
+    fn at(&mut self, now: Instant, draws: u32) -> (bool, bool) {
+        if self.last.is_some_and(|at| now.saturating_duration_since(at) < Self::HOLD) {
+            return (true, false);
+        }
+        if self.done >= Self::MOST
+            || now.saturating_duration_since(self.first) < Self::AFTER
+            || !(1..=Self::SCREEN).contains(&draws)
+            || self.last.is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+        {
+            return (false, false);
+        }
+        self.last = Some(now);
+        self.done += 1;
+        (true, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
     use crate::HleResolver;
+
+    /// `VICTORY_AUTO_START`: Enter only at the start screen, after its wait,
+    /// held a moment every few seconds, four times at most; never while the
+    /// world draws.
+    #[test]
+    fn the_start_screen_is_pressed_four_times_at_most() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        let mut p = Presses::new(t0);
+        assert_eq!(p.at(at(10.0), 11), (false, false), "too early");
+        assert_eq!(p.at(at(33.0), 0), (false, false), "no frame drawn yet");
+        assert_eq!(p.at(at(33.0), 3000), (false, false), "the world");
+        assert_eq!(p.at(at(33.0), 11), (true, true));
+        assert_eq!(p.at(at(33.1), 11), (true, false), "held");
+        assert_eq!(p.at(at(33.3), 11), (false, false), "let go");
+        assert_eq!(p.at(at(36.0), 11), (false, false), "not again so soon");
+        for k in 0..3 {
+            assert_eq!(p.at(at(38.0 + 5.0 * k as f64), 4), (true, true));
+        }
+        assert_eq!(p.at(at(60.0), 4), (false, false), "four presses at most");
+    }
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;

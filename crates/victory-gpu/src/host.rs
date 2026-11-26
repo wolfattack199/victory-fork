@@ -8214,6 +8214,7 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8229,6 +8230,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    crate::port::filled(src, len);
                     if !crate::plaincopy::copy_small(dst as *mut u8, src as *const u8, len) {
                         copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     }
@@ -8571,6 +8573,16 @@ impl Batch {
 /// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
 /// title's big pools (it walks the page tables to the region's end), which
 /// made copies run at 100-200 MB/s.
+/// Draws a frame as the window's caption last said them (0 before the
+/// first), for the runtime's `VICTORY_AUTO_START`.
+static RECENT_DRAWS: AtomicU32 = AtomicU32::new(0);
+
+/// Draws a frame as the window's caption last said them: the title's start
+/// screen draws 4 to 11 things, the world thousands.
+pub fn recent_draws() -> u32 {
+    RECENT_DRAWS.load(Ordering::Relaxed)
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -9151,6 +9163,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::port::log(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
@@ -9453,6 +9466,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
+        RECENT_DRAWS.store(draws as u32, Ordering::Relaxed);
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);

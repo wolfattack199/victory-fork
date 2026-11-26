@@ -19,11 +19,11 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-26) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 862 tests pass, 1 fails, 15 are ignored (2026-11-26, morning; the graphics crate has one test more since, 286 of 286 in most runs). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. Some tests of the graphics crate fail in some runs and not in others, a different one each time: in 14 runs of the crate this morning, 3 had a failure and one stopped without a result, as noted before (`memory_that_is_no_view_is_not_written_behind`, `warp_a_fetch_through_the_copy_queue_brings_what_the_direct_queue_brings`, and in a run without this morning's last change `waits_end_on_ticks_and_count_frames` with `written_pages_are_reported_to_every_asker`); each passes run again. They share tables of views and sections with tests running beside them, which is the likely cause; not mended yet. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before. At midday only the runtime crate changed (the pool switch of the newest update): its 156 tests pass |
+| Checks | 862 tests pass, 1 fails, 15 are ignored (2026-11-26, morning; the graphics crate has one test more since, 286 of 286 in most runs). The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before these updates too. Some tests of the graphics crate fail in some runs and not in others, a different one each time: in 14 runs of the crate this morning, 3 had a failure and one stopped without a result, as noted before (`memory_that_is_no_view_is_not_written_behind`, `warp_a_fetch_through_the_copy_queue_brings_what_the_direct_queue_brings`, and in a run without this morning's last change `waits_end_on_ticks_and_count_frames` with `written_pages_are_reported_to_every_asker`); each passes run again. They share tables of views and sections with tests running beside them, which is the likely cause; not mended yet. `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset` fails in some runs and not in others (2 of 14 runs of its crate before this update, 1 of 13 with it; it places plain private memory, which this update does not touch), and the graphics crate's test program has stopped without a result on an access violation while it and others were under way, once in each of two series of runs. `warp_budget_saturates_without_wraparound_and_preserves_draw_fields` took for granted which group of 64 records the card runs first, and accepts either since the update before. At midday only the runtime crate changed: its 156 tests pass. With the newest update (four tests more in the graphics crate, two in the runtime's): the runtime's 156 pass; the graphics crate's 290 pass in most runs, and in 26 runs of it one test failed 5 times (4 of them `warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset`, the first one's name not kept) and the test program stopped on an access violation 3 times. Without the three new tests that place memory (10 of those runs) it was 3 failures of that test and 1 stop, so they do not cause them |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
-| Frame rate in the opening cutscene | **about 4.0 fps** (2026-11-26, midday: seven usual runs since the morning, 3.47 to 4.67, 3.96 on average). The code of the night before, built again and run the same way, gave 4.15 today (one run), so the lower figure most likely comes from the PC's state (memory, see the newest update), not from the morning's changes; that night's ten runs gave 4.81 on average. About 4.0 in the three clean runs before those, about 3.5 before that, about 2.0 before that. Still far from 30 |
+| Frame rate in the opening cutscene | **about 3.7 fps** (2026-11-26, morning: the nine runs c66-c76 that reached the world, 2.37 to 4.86, 3.75 on average). The same code gave 2.37 and 4.38 fps five minutes apart (c75, c76), so one run says little. 3.96 on average at midday, 4.81 the night before. Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
@@ -72,14 +72,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 20 % | 23 % before: it now counts the usual runs since the morning, 3.96 fps on average, no longer the night's | measured: 3.89, 4.12 and 3.82 fps in the three usual runs at midday (c62, c64, c65), 4.67, 4.28, 3.50 and 3.47 in the four usual runs of the morning (c42, c48, c51, c58; the others had switches on for measuring or an older build, see the two newest updates); the night's code, built again, 4.15 (c61); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
-| Frame rate in the opening cutscene, towards 30 fps | about 13 % | 15 % before | the same runs |
+| Frame rate in the opening cutscene, towards 20 fps | about 19 % | 20 % before | measured: 3.95, 3.67, 4.12, 4.86, 4.54, 2.51, 3.32, 2.37 and 4.38 fps in the nine runs of the newest update that reached the world (c66-c68, c70-c73, c75, c76), 3.75 on average; some had switches on for measuring (see the newest update), none of which changed the frame rate clearly. Before them: 3.89, 4.12 and 3.82 fps in the three usual runs at midday (c62, c64, c65), 4.67, 4.28, 3.50 and 3.47 in the four usual runs of the morning (c42, c48, c51, c58; the others had switches on for measuring or an older build, see the two newest updates); the night's code, built again, 4.15 (c61); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 30 fps | about 12 % | 13 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 44 to 53 ms busy in c32-c34, c36 and c37 (30 to 36 the title's lists, 13 to 17 sending and hashing, 1 to 1.5 comparing) at 2,700 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 56 of the last 58 short runs | 49 of 51 before | measured: the 75 s cutscene runs c8 to c65 ran to the end and closed when asked, except c55, where the title stopped on a breakpoint of its own while loading (see the newest update below); and in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 65 of the last 69 short runs | 56 of 58 before | measured: of the runs of the newest update, c69 stopped on a fault in the descriptor code (mended since, with a test) and c74 stood at the start screen because the game's window was not in front (the runtime can press Enter there now, `VICTORY_AUTO_START=1`); the 75 s cutscene runs c8 to c65 ran to the end and closed when asked, except c55, where the title stopped on a breakpoint of its own while loading (see the newest update below); and in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -90,6 +90,67 @@ another PC.
 The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed, unless they name the cutscene. The estimates
 are my own judgment, not measurements.
+
+### New in this update (2026-11-26, morning): renderer port 1 from the 7900 XTX fork; the start screen without the window in front; where the longest frames go
+
+Eleven cutscene runs (c66-c76), 75 s each as before. Three switches were
+added, all off; one crash was mended. Nothing else changes what the game
+does by default.
+
+- **Renderer port 1** (`VICTORY_PORT_CONSTANTS=1`, off), brought over from
+  [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+  (its commits 86dc1097, 4b82f6c2 and 9c23e8dd), read line by line and fitted
+  to this code. The title asks for its 185 MB graphics heap, which holds its
+  174 MB constants buffer, in one call, and maps the heap's five pieces in
+  another order than their addresses. With the switch, the runtime gives the
+  heap's pages the slices of their section in address order. It moves only
+  pages never shown yet: they are zeros, and the title cannot tell them
+  apart. The heap is then one stretch of one section, and the card reads it
+  in place: no host copy, nothing sent up or fetched back for it. In c75 and
+  c76 all 185 MB were placed.
+  - **It did not make the cutscene faster:** 2.37 and 4.38 fps (c75, c76).
+  - **Why:** the processor still copies some 12,000 constant buffers a frame
+    (about 4.2 MB) out of the heap into upload memory, because D3D12 wants
+    them on 256 bytes and the console has them on 16. The fork removes these
+    copies with its port 5 (translated shaders read constant buffers as raw
+    bytes), which rests on some 280 commits of the fork's that this copy does
+    not have. Those copies are also only about 4 of the 150 to 180 MB copied
+    a frame. Not ported.
+- **The start screen pressed by the runtime** (`VICTORY_AUTO_START=1`, off).
+  A run stood still at the start screen when the game's window was not in
+  front (c74). With the switch the runtime presses Enter itself: from 32 s
+  after launch, every 4 s, at most four times, and only while frames have 1
+  to 20 draws (the start screen draws 4 to 11). c76 reached the world with
+  it.
+- **Mended: a crash in the descriptor code** (c69). A span shorter than its
+  head was given a next start past its end. A test covers it.
+- **Tried, and none of them changed the frame rate clearly:**
+  - Partly mapped textures read again every 3 s instead of every half second
+    (`VICTORY_PARTIAL_MS=3000`, c71): 4.54 fps. Of the texture memory
+    detiled a frame (52 to 173 MB, `VICTORY_TEXTURE_CHANGES=1`, c70 and c71),
+    30 to 130 MB comes through the path for partly mapped textures. Nearly
+    all of it is textures detiled before, and their bytes did change: their
+    pages are streaming in. Detiling only what changed is what would help.
+  - Detiling such a texture only when the levels it holds or their bytes
+    changed (`VICTORY_TEXTURE_HELD_ONLY=1`, c69 and c70): no such case was
+    ever found (0 passed over), so it stays off.
+  - Mapping the same pages again at the same address, a probe not kept
+    (c72): it never happens (0 calls).
+  - More free memory: with three programs closed (c73, 17.4 GB of RAM free),
+    3.32 fps.
+- **Where the longest frames go.** Frames of 1 to 4 s are the title's own
+  page mapping. In one 4 s frame of c75, 2,016 of the title's mapping calls
+  took 3.7 s (about 1.8 ms a call), with 55,000 to 60,000 page faults.
+  - Mapping or unmapping one 64 KiB view in the kernel costs 15 to 30 µs on
+    average in some runs (c54, c59, c60, c72, c76) and 100 to 170 µs in
+    others (c51, c53, c58, c68, c75), with the same code. The slow runs are
+    slow already on the loading screens, before the world.
+  - What makes the difference is not known yet. It is not free RAM (c73),
+    not the same pages mapped again (c72), and not the commit limit (30 of
+    58.9 GB used with the game closed now).
+- **Same code, different results.** The same build and switches gave 2.37
+  and 4.38 fps five minutes apart (c75, c76). One run says little; the
+  figures above are averages.
 
 ### New in this update (2026-11-26, midday): the morning's code is not slower; where the memory goes; what the frame waits for
 
