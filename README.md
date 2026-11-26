@@ -63,14 +63,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 24 % | about 20 % before (21 % was said: two runs of three) | measured: 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 20 fps | about 24 % | no clear change | measured: 4.67 and 4.28 fps in the two usual runs since (c42, c48; the others had switches on for measuring, see the newest update); before them 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
 | Frame rate in the opening cutscene, towards 30 fps | about 16 % | about 13 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 44 to 53 ms busy in c32-c34, c36 and c37 (30 to 36 the title's lists, 13 to 17 sending and hashing, 1 to 1.5 comparing) at 2,700 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 34 of the last 34 short runs | 17 of 17 before | measured: the 75 s cutscene runs c8 to c41 ran to the end and closed cleanly. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 42 of the last 43 short runs | 34 of 34 before | measured: the 75 s cutscene runs c8 to c50 ran to the end and closed when asked, but in c46 the card's device was lost two minutes in (a fault in a shader, reported by the driver; see the newest update below), so it does not count. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -81,6 +81,63 @@ another PC.
 The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed, unless they name the cutscene. The estimates
 are my own judgment, not measurements.
+
+### New in this update (2026-11-26, morning): where the long frames come from; switches measured, none adopted
+
+Nine cutscene runs since the update below (c42-c50): three usual ones (c42,
+c46 and c48, with Windows' memory counters read in c48) and six with a switch
+or a measurement on; and the full checks (862 pass; the one shader test that
+failed before still fails). New in the code: the merge of what shaders wrote
+compares 32 bytes at a time, and two switches for measuring, off by default
+(`VICTORY_WRITE_PLAIN`, `VICTORY_GRAIN_SAMPLE`). Tests check the merge against
+the old loop and the plain write on a page that is not there.
+
+- **Writing back what shaders wrote** (`crates/victory-gpu/src/shadow.rs`,
+  `crates/victory-gpu/src/plaincopy.rs`). A thread of its own puts what
+  shaders wrote back into title memory: 55 to 68 MB a frame, 55 to 61 ms
+  (c42-c45), about 0.92 ms a MB. Now it compares 32 bytes at a time (AVX2)
+  instead of one, with the old loop for processors without AVX2 and a test
+  that the two agree; the cost a MB did not clearly change, so the time is in
+  moving the memory, not in comparing it. Writing title memory directly with a
+  guarded store instead of through Windows (`VICTORY_WRITE_PLAIN=1`, off by
+  default): 0.85 to 0.86 ms a MB, about 7 % less, and none of 1,009,106
+  writes found a page missing (c43-c45); but those three runs made 4.69, 3.32
+  and 3.49 fps, with frames up to 3.1 s, so it stays off until a run says why.
+- **How much of a guarded block changes** (`VICTORY_GRAIN_SAMPLE=1`, off by
+  default, for measuring). The guards find the title's writes 64 KiB at a
+  time, and a block found written is copied whole: 160 to 200 MB a frame. In
+  one copy of 32 the 4 KiB pages were compared with the copy's: in c47,
+  86,423 of 324,141 had changed (27 %; 8 to 59 % from one log line to the
+  next). Guards of 4 KiB would copy less, but each guard costs about 35 µs
+  now (1,453 a frame took 51 ms in c47), and a block's changed pages would
+  each need one: about three times as many. Not worth it as things stand.
+- **The PC runs short of memory in the cutscene.** Measured with Windows'
+  counters over the measured minute of c48 (a usual run, 4.28 fps): 838 MB
+  of the 32 GB free on average, 12,320 pages a second read from disk to
+  resolve faults, 45,194 faults a second on pages Windows had taken away,
+  and the process at 19.7 GB in memory, 22.3 GB private. The long frames go
+  with the title's remapping of its memory, which slows from about 0.04 ms a
+  call to 0.3 to 0.6 ms in them (frame 4183 of c47: 1,541 calls, 873 ms).
+- **A finer grid for windows of title memory** (`VICTORY_WINDOW_KB=256`,
+  off): 1.6 GB less private memory, 2,224 MB free on average and 4,995 pages
+  a second read from disk (c49, against c48 above); but 3.28 fps, and the
+  title's remaps were slower still (248 µs a call against 101), so memory
+  short is not all that slows them. Not adopted; one run each.
+- **Windows read in place** (`VICTORY_INPLACE=1`, off; never run in the
+  cutscene before): only 80 windows (380 MB) could be opened in place, and
+  1,200 were turned down, nearly all of them in the title's pool of
+  physical pages, which cannot be opened that way (c50: 3.75 fps, and the
+  card's time in the title's lists 56 ms against 34 in c48). Not adopted.
+  Showing the pool's scattered pages to the card as tiles of one buffer is
+  ruled out too: tile mappings into an opened heap remove the device (an
+  earlier probe, `crates/victory-gpu/src/inplace.rs`).
+- **A lost device in c46.** About two minutes in, the driver reported a
+  fault in a shader on the card ("Graphics SM Global Exception … Multiple
+  Warp Errors"), and the device was lost (0x887A0006) while the submitting
+  thread prepared a submission. It is the first in all the run logs kept
+  here; the driver watch turned off the draw windows (`VICTORY_INDIRECT_WINDOW`),
+  the path it holds suspect for such faults, as it should. Not understood
+  yet. c47 ran in the same way and closed cleanly.
 
 ### New in this update (2026-11-26, night): textures' memory asked of the runtime, about 4.7 fps
 

@@ -8764,6 +8764,9 @@ pub(crate) fn write_title(behind: &Option<crate::behind::Behind>, dst: usize, sr
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if crate::plaincopy::write(dst, src, len) {
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -9168,6 +9171,14 @@ impl Meter {
         {
             let [watched, whole] = [0, 1].map(|i| crate::shadow::FREE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
             let [small, pages, blocks] = [0, 1, 2].map(|i| crate::watch::GRAIN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [looked, differed] = [0, 1].map(|i| crate::shadow::GRAIN_4K[i].swap(0, Ordering::Relaxed));
+            if looked > 0 {
+                tracing::info!(
+                    "of the 4 KiB pages of host copies refreshed, one copy in 32 looked at (VICTORY_GRAIN_SAMPLE): {looked}, \
+                     {differed} of them changed ({:.0} %)",
+                    100.0 * differed as f64 / looked as f64
+                );
+            }
             if watched + whole > 0.0 {
                 tracing::info!(
                     "host copies of title memory refreshed per frame: {watched:.1} MB by the pages found written, {whole:.1} MB \
@@ -9207,6 +9218,14 @@ impl Meter {
                 })
                 .collect();
             tracing::info!("the pass over textures picked by index, per frame: {}", parts.join(", "));
+            if crate::plaincopy::write_on() {
+                let [writes, bytes, gone] = [0, 1, 2].map(|i| crate::plaincopy::WRITES[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "what shaders wrote, written into title memory in place (VICTORY_WRITE_PLAIN): {writes} writes, {} MB, \
+                     since the start; {gone} met a page that was not there and went through the kernel",
+                    bytes >> 20
+                );
+            }
             let [known, checked, differed] =
                 [0, 1, 2].map(|i| crate::texture::MAPPED_KNOWN[i].load(Ordering::Relaxed));
             if known > 0 {

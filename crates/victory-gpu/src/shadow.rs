@@ -871,6 +871,16 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2 (asked just now).
+        return unsafe { merge_piece_avx2(now, held, title) };
+    }
+    merge_piece_bytes(now, held, title)
+}
+
+/// [`merge_piece`] byte by byte.
+fn merge_piece_bytes(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -880,6 +890,40 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+/// [`merge_piece`] 32 bytes at a time. (Byte by byte it was a quarter of
+/// the working time of the thread that lands what the card wrote, run
+/// c44.) Where `now` and `held` agree, `held` already is `now`, so `held`
+/// becomes `now` whole.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_or_si256, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let len = now.len().min(held.len()).min(title.len());
+    let whole = len / 32 * 32;
+    let mut differs = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < whole {
+        // SAFETY: `i + 32 <= len` for all three slices; unaligned loads and
+        // stores.
+        unsafe {
+            let n = _mm256_loadu_si256(now.as_ptr().add(i).cast::<__m256i>());
+            let h = _mm256_loadu_si256(held.as_ptr().add(i).cast::<__m256i>());
+            let t = _mm256_loadu_si256(title.as_ptr().add(i).cast::<__m256i>());
+            // The title's byte where the card left it, the card's where not.
+            let merged = _mm256_blendv_epi8(n, t, _mm256_cmpeq_epi8(n, h));
+            differs = _mm256_or_si256(differs, _mm256_xor_si256(merged, t));
+            _mm256_storeu_si256(title.as_mut_ptr().add(i).cast::<__m256i>(), merged);
+            _mm256_storeu_si256(held.as_mut_ptr().add(i).cast::<__m256i>(), n);
+        }
+        i += 32;
+    }
+    let tail = merge_piece_bytes(&now[whole..len], &mut held[whole..len], &mut title[whole..len]);
+    _mm256_testz_si256(differs, differs) == 0 || tail
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1343,6 +1387,48 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b_chunks[chunk])
         .rposition(|(x, y)| x != y)
         .map(|i| chunk * DIFF_CHUNK + i)
+}
+
+#[cfg(test)]
+mod merge_simd_tests {
+    use super::{merge_piece, merge_piece_bytes};
+
+    /// 32 bytes at a time merges as byte by byte does, at every length and
+    /// start, with bytes the card changed, the title changed, both, and
+    /// neither.
+    #[test]
+    fn merged_by_32_as_byte_by_byte() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for len in [0usize, 1, 7, 31, 32, 33, 63, 64, 65, 100, 255, 1000, 4096 + 13] {
+            for start in [0usize, 1, 5, 31] {
+                let n = start + len;
+                let now: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                // Held: the card's bytes, with some changed (what the card
+                // wrote since).
+                let held: Vec<u8> = now.iter().map(|&b| if next() % 4 == 0 { b ^ 0x5a } else { b }).collect();
+                let title: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                let (mut h1, mut t1) = (held.clone(), title.clone());
+                let (mut h2, mut t2) = (held.clone(), title.clone());
+                let a = merge_piece(&now[start..], &mut h1[start..], &mut t1[start..]);
+                let b = merge_piece_bytes(&now[start..], &mut h2[start..], &mut t2[start..]);
+                assert_eq!((a, &h1, &t1), (b, &h2, &t2), "{len} from {start}");
+            }
+        }
+        // Nothing the card changed, or what it changed already there: no change.
+        let now = vec![3u8; 100];
+        let (mut held, mut title) = (now.clone(), vec![9u8; 100]);
+        assert!(!merge_piece(&now, &mut held, &mut title));
+        assert!(title.iter().all(|&b| b == 9));
+        let (mut held, mut title) = (vec![4u8; 100], now.clone());
+        assert!(!merge_piece(&now, &mut held, &mut title), "the title holds the card's bytes already");
+        assert_eq!(held, now);
+    }
 }
 
 #[cfg(test)]
@@ -2026,6 +2112,19 @@ fn merge_gap() -> usize {
 /// from title memory by the pages found written, and whole (memory nobody
 /// watches).
 pub(crate) static FREE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Diagnostic (`VICTORY_GRAIN_SAMPLE=1`; off by default): in one copy of 32
+/// of 64 KiB or more, the 4 KiB pages looked at, and those whose bytes
+/// differed from the copy's. The guards find writes 64 KiB at a time and a
+/// refresh copies all of such a block: this says how much of it changed.
+pub(crate) static GRAIN_4K: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn grain_sample() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GRAIN_SAMPLE").is_some_and(|v| v == "1"))
+        && N.fetch_add(1, Ordering::Relaxed) % 32 == 0
+}
 
 /// Whether a refresh of a copy in the card's memory stores and sends on
 /// only the bytes that differ from the copy's CPU side
@@ -3713,7 +3812,25 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if to - from >= PAGE && grain_sample() {
+            // Read aside first, to count the 4 KiB pages that changed.
+            let mut fresh = vec![0u8; to - from];
+            crate::host::copy_mapped(fresh.as_mut_ptr(), from as *const u8, to - from, false);
+            // SAFETY: inside the mapping; nothing writes it while we hold
+            // the copy's lock for the range (as for the copy below).
+            let held = unsafe { std::slice::from_raw_parts(at, to - from) };
+            let (mut all, mut differ) = (0u64, 0u64);
+            for (a, b) in held.chunks(4096).zip(fresh.chunks(4096)) {
+                all += 1;
+                differ += u64::from(a != b);
+            }
+            GRAIN_4K[0].fetch_add(all, Ordering::Relaxed);
+            GRAIN_4K[1].fetch_add(differ, Ordering::Relaxed);
+            // SAFETY: as above.
+            unsafe { std::ptr::copy_nonoverlapping(fresh.as_ptr(), at, to - from) };
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         if snapshot
             && let Some(before) = self
                 .before
