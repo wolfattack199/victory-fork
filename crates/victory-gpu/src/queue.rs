@@ -1145,7 +1145,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
@@ -1278,7 +1278,19 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// Whether the title has shown its world: [`WORLD_FRAMES`] frames in a row
+/// of [`WORLD_DRAWS`] draws or more (menus, the title screen and loading
+/// screens draw a few hundred).
+static WORLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const WORLD_DRAWS: u64 = 1500;
+const WORLD_FRAMES: u64 = 30;
+
+/// Whether the title has shown its world since it started (once true, it
+/// stays true): input takes its play bindings then.
+pub fn world_shown() -> bool {
+    WORLD.load(Ordering::Relaxed)
+}
+
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1325,7 +1337,6 @@ extern "system" fn present(
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
-        #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
     }
     hr
@@ -1371,6 +1382,65 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    {
+        // Which thread of the title presents, for a profiler that looks for it.
+        static PRESENTER: AtomicU64 = AtomicU64::new(0);
+        // SAFETY: no conditions.
+        let me = u64::from(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
+        if PRESENTER.swap(me, Ordering::Relaxed) != me {
+            tracing::info!(frame, thread = me, "the thread that presents");
+        }
+    }
+    #[cfg(windows)]
+    if !WORLD.load(Ordering::Relaxed) {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static STREAK: AtomicU64 = AtomicU64::new(0);
+        let drawn = crate::draw::drawn();
+        let this = drawn.saturating_sub(LAST.swap(drawn, Ordering::Relaxed));
+        if this < WORLD_DRAWS {
+            STREAK.store(0, Ordering::Relaxed);
+        } else if STREAK.fetch_add(1, Ordering::Relaxed) + 1 >= WORLD_FRAMES && !WORLD.swap(true, Ordering::Relaxed) {
+            tracing::info!(frame, draws = this, "the title shows its world");
+        }
+    }
+    #[cfg(windows)]
+    if frame.is_multiple_of(256) {
+        static LAST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        let d: Vec<f64> = crate::draw::CONSTANTS
+            .iter()
+            .zip(&LAST)
+            .map(|(now, last)| {
+                let now = now.load(Ordering::Relaxed);
+                now.saturating_sub(last.swap(now, Ordering::Relaxed)) as f64 / 256.0
+            })
+            .collect();
+        tracing::info!(
+            "constants per frame: {:.0} root constant buffers read from their host copy, {:.0} copied into upload memory ({:.1} MB), {:.0} copied by the card; of descriptor tables {:.0} copied into upload memory ({:.1} MB), {:.0} by the card (VICTORY_CONSTANTS_ON_CARD)",
+            d[0],
+            d[1],
+            d[2] / 1e6,
+            d[5],
+            d[3],
+            d[4] / 1e6,
+            d[6]
+        );
+        static CLAMPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        let k: Vec<f64> = crate::indirect::CLAMP_WAITS
+            .iter()
+            .zip(&CLAMPS)
+            .map(|(now, last)| {
+                let now = now.load(Ordering::Relaxed);
+                now.saturating_sub(last.swap(now, Ordering::Relaxed)) as f64 / 256.0
+            })
+            .collect();
+        tracing::info!(
+            "indirect clamps per frame: {:.0}, of them {:.0} without the wait before and {:.0} without the wait after (VICTORY_CLAMP_LEAN)",
+            k[0],
+            k[1],
+            k[2]
+        );
+    }
     #[cfg(windows)]
     crate::pipeline::note_frame(crate::draw::drawn());
     #[cfg(windows)]

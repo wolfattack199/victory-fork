@@ -37,23 +37,34 @@ pub(crate) fn blocks_wanted() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_none_or(|v| v != "0"))
 }
 
-/// The free ranges of the blocks, by size and by place.
+/// The free ranges of the blocks, by size and by place, and the free bytes
+/// of each block.
 #[derive(Default)]
 struct Ranges {
     by_size: BTreeSet<(u64, u32, u64)>,
     by_place: BTreeMap<(u32, u64), u64>,
+    free_in: Vec<u64>,
 }
+
+/// How many free ranges that fit [`Ranges::take`] weighs at most.
+const WEIGHED: usize = 4096;
 
 impl Ranges {
     fn remove(&mut self, block: u32, at: u64) -> Option<u64> {
         let size = self.by_place.remove(&(block, at))?;
         self.by_size.remove(&(size, block, at));
+        self.free_in[block as usize] -= size;
         Some(size)
     }
 
     fn insert(&mut self, block: u32, at: u64, size: u64) {
         self.by_place.insert((block, at), size);
         self.by_size.insert((size, block, at));
+        let block = block as usize;
+        if self.free_in.len() <= block {
+            self.free_in.resize(block + 1, 0);
+        }
+        self.free_in[block] += size;
     }
 
     /// Adds `[at, at + size)` of `block`, joined with what is free beside
@@ -74,9 +85,25 @@ impl Ranges {
         size
     }
 
-    /// Takes `size` bytes of the smallest range that has them.
+    /// Takes `size` bytes of a range that has them: in the fullest block
+    /// that has one (the fewest free bytes), its smallest such range.
+    ///
+    /// It was the smallest range of all blocks, wherever it lay: new
+    /// textures went into the emptiest blocks as readily as into the
+    /// fullest, and a block is given back only when no texture is left in
+    /// it. In run m31 the 89 blocks (5.7 GB of the card's memory, which
+    /// Windows charges to the PC's commit as well) were 41 % free, in
+    /// pieces, and not one of them wholly. Filling the fullest first lets
+    /// the others empty as their textures go.
     fn take(&mut self, size: u64) -> Option<(u32, u64)> {
-        let &(len, block, at) = self.by_size.range((size, 0, 0)..).next()?;
+        let mut best: Option<(u64, u64, u32, u64)> = None;
+        for &(len, block, at) in self.by_size.range((size, 0, 0)..).take(WEIGHED) {
+            let key = (self.free_in[block as usize], len, block, at);
+            if best.is_none_or(|b| key < b) {
+                best = Some(key);
+            }
+        }
+        let (_, len, block, at) = best?;
         self.remove(block, at);
         if len > size {
             self.insert(block, at + size, len - size);
@@ -105,12 +132,23 @@ static BLOCKS: Mutex<Blocks> = Mutex::new(Blocks {
     free: Ranges {
         by_size: BTreeSet::new(),
         by_place: BTreeMap::new(),
+        free_in: Vec::new(),
     },
     resting: VecDeque::new(),
 });
 
 /// For the log: blocks alive, textures placed since the start.
 pub(crate) static PLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the log: the bytes of the blocks that hold no texture now (free, and
+/// resting), and the blocks wholly free.
+pub(crate) fn free_bytes() -> (u64, u64, usize) {
+    let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let free = blocks.free.by_place.values().sum();
+    let resting = blocks.resting.iter().map(|(_, p)| p.size).sum();
+    let whole = blocks.free.by_size.range((BLOCK, 0, 0)..).count();
+    (free, resting, whole)
+}
 
 /// A texture's place in a block, given back when it is dropped (after the
 /// texture itself).
@@ -332,6 +370,24 @@ mod tests {
         assert_eq!(r.add(0, 30, 30), 100);
         assert_eq!(r.by_place.len(), 1);
         assert_eq!(r.by_size.len(), 1);
+    }
+
+    #[test]
+    fn the_fullest_block_is_filled_first() {
+        let mut r = Ranges::default();
+        r.add(0, 0, 100);
+        r.add(1, 0, 100);
+        // Block 1 has a texture: 40 of it free less.
+        assert_eq!(r.take(40), Some((0, 0)));
+        assert_eq!(r.free_in, vec![60, 100]);
+        // The next goes into block 0 too, though block 1 has a bigger range.
+        assert_eq!(r.take(50), Some((0, 40)));
+        // Too big for block 0: block 1.
+        assert_eq!(r.take(20), Some((1, 0)));
+        assert_eq!(r.free_in, vec![10, 80]);
+        // What goes comes back, joined.
+        assert_eq!(r.add(0, 0, 40), 40);
+        assert_eq!(r.free_in, vec![50, 80]);
     }
 
     #[test]

@@ -244,6 +244,9 @@ pub(super) struct Kbm {
     sensitivity: f32,
     driving: bool,
     menu: bool,
+    /// Whether the menu bindings were left by themselves once the world
+    /// was shown ([`Kbm::auto_play`]).
+    played: bool,
     released: bool,
     /// Keys down at the last poll: a switch acts when its key goes down.
     was: Vec<u8>,
@@ -278,6 +281,7 @@ impl Kbm {
             driving: false,
             // A title starts in its menus.
             menu: true,
+            played: false,
             released: false,
             was: Vec::new(),
             moves: VecDeque::new(),
@@ -354,9 +358,25 @@ impl Kbm {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Once, when the title first shows its world: the play bindings, so
+    /// that W A S D walk without F10 first (`VICTORY_KBM_AUTO_PLAY=0`: not).
+    /// F10 and Esc switch as before.
+    fn auto_play(&mut self) {
+        if self.played || !self.menu || !victory_gpu::queue::world_shown() {
+            return;
+        }
+        self.played = true;
+        if std::env::var_os("VICTORY_KBM_AUTO_PLAY").is_some_and(|v| v == "0") {
+            return;
+        }
+        self.menu = false;
+        tracing::info!("keyboard and mouse: the world is shown, play bindings from now on (F10 or Esc: menu bindings)");
+    }
+
     /// The gamepad these keys and this mouse make.
     pub(super) fn pad(&mut self, keys: &[KeyState], mouse: &Mouse, now: Instant) -> PadState {
         self.reread(now);
+        self.auto_play();
         let mut held: Vec<u8> = keys.iter().map(|k| k.virtual_key).collect();
         held.extend(&mouse.buttons);
         held.extend(self.notch(mouse.wheel, now));

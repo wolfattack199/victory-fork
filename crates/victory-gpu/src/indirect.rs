@@ -374,6 +374,32 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// Whether a clamp pass waits for earlier shader writes only where it must
+/// (on by default; `VICTORY_CLAMP_LEAN=0` waits both times as before,
+/// `alt`: in turn). Measured 4.5 ms off the usual frame (run m27), and on
+/// in runs m27-m31 with no fault seen in the picture.
+///
+/// Each clamp of an indirect execution waited for every shader write
+/// before it and again after it: two unordered access barriers on no
+/// resource, each of which drains the whole card, for a pass of a few
+/// records. After the pass the wait is not needed: the change of the
+/// clamp's output to indirect arguments puts the execution behind its
+/// writes, and the budget word it charges is changed by atomics only.
+/// Before it the wait is needed only if a draw or dispatch whose shaders
+/// can store to buffers was recorded since the list last waited for every
+/// shader write (the title's own barriers mostly put one right before its
+/// executions); at the start of a list it is always made.
+pub(crate) fn clamp_lean() -> bool {
+    static SWITCH: crate::turns::Switch =
+        crate::turns::Switch::new("VICTORY_CLAMP_LEAN", true, "indirect clamps wait for shader writes only where needed");
+    SWITCH.on()
+}
+
+/// Clamps since the start: those recorded, their waits before left out, and
+/// their waits after left out ([`clamp_lean`]). Said with the constants line
+/// (`crate::queue`).
+pub(crate) static CLAMP_WAITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -389,9 +415,18 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let lean = clamp_lean();
+    let waits = (!lean || !list.writes_waited(), !lean);
+    let recorded = record_clamp_waits(c, &list.list, (dst, before), budget, src, count, spec, ahead, waits);
     if recorded {
         list.indirect_readable(dst);
+        use std::sync::atomic::Ordering::Relaxed;
+        CLAMP_WAITS[0].fetch_add(1, Relaxed);
+        CLAMP_WAITS[1].fetch_add(u64::from(!waits.0), Relaxed);
+        CLAMP_WAITS[2].fetch_add(u64::from(!waits.1), Relaxed);
+        if waits.0 {
+            list.waited_for_writes();
+        }
     }
     recorded
 }
@@ -407,10 +442,27 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_waits(c, l, (dst, before), budget, src, count, spec, ahead, (true, true))
+}
+
+/// [`record_clamp_as`], with the waits for every earlier shader write
+/// before the pass and after it as asked (`waits`; [`clamp_lean`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_waits(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    (wait_before, wait_after): (bool, bool),
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -482,10 +534,11 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    // The transitions always; each wait for every shader write as asked.
+    let (skip_first, skip_second) = (usize::from(!(waits && wait_before)), usize::from(!(waits && wait_after)));
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -496,7 +549,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
     true
 }
@@ -1215,6 +1268,58 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// The merge by a mask (`crate::host::CARD_MASK`), on the software
+    /// adapter: the bytes a mask names take the CPU side's, every other byte
+    /// keeps what the card held, in stretches of whole, partial and empty
+    /// dwords and in a second stretch further on.
+    #[test]
+    fn warp_card_mask_writes_the_named_bytes_and_keeps_the_others() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let mask = compile_cs(&warp.device, crate::host::CARD_MASK).expect("the card mask must compile on WARP");
+        const SIZE: usize = 8192;
+        let (_cpu, cpu_ptr, cpu_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_masks, masks_ptr, masks_gpu) = warp.shared_buffer(4096);
+        let cpu: Vec<u8> = (0..SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        let card: Vec<u8> = (0..SIZE).map(|i| !((i * 13 + 1) as u8)).collect();
+        // Named bytes: (stretch start on four bytes, the bytes from there).
+        let named: [(usize, &[usize]); 2] = [(64, &[0, 1, 2, 3, 5, 9, 10, 31, 32, 33, 34, 35, 100, 255]), (4096, &[0, 7, 1000, 1023])];
+        let mut want = card.clone();
+        // SAFETY: the mappings hold what is written and read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(cpu.as_ptr(), cpu_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(card.as_ptr(), card_ptr, SIZE);
+            let mut words_at = 32usize;
+            for (s, (at, bytes)) in named.iter().enumerate() {
+                let n = bytes.iter().max().unwrap() + 1;
+                let mut bits = vec![0u32; n.div_ceil(32)];
+                for &b in *bytes {
+                    bits[b / 32] |= 1 << (b % 32);
+                    want[at + b] = cpu[at + b];
+                }
+                let head = [(*at / 4) as u32, bits.len() as u32, words_at as u32];
+                std::ptr::copy_nonoverlapping(head.as_ptr().cast::<u8>(), masks_ptr.add(s * 12), 12);
+                std::ptr::copy_nonoverlapping(bits.as_ptr().cast::<u8>(), masks_ptr.add(words_at), bits.len() * 4);
+                words_at += bits.len() * 4;
+            }
+            warp.list.SetComputeRootSignature(&mask.root);
+            warp.list.SetPipelineState(&mask.pso);
+            let stretches = named.len() as u32;
+            warp.list.SetComputeRoot32BitConstants(0, 1, (&raw const stretches).cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, cpu_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, masks_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            warp.list.Dispatch(stretches, 1, 1);
+        }
+        warp.submit_and_wait();
+        // SAFETY: as above.
+        let got = unsafe { std::slice::from_raw_parts(card_ptr, SIZE) };
+        let wrong: Vec<usize> = (0..SIZE).filter(|&i| got[i] != want[i]).collect();
+        assert!(wrong.is_empty(), "{} bytes wrong, the first at {:?}", wrong.len(), wrong.first());
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software

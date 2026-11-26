@@ -665,6 +665,35 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Constants that go through a list's upload memory, since the start: root
+/// views read from their host copy (count), root views copied into upload
+/// memory (count, bytes), table constant buffers copied there (count,
+/// bytes). Said every 256 frames (`crate::queue`): how much of what the card
+/// reads across the bus a frame is constants.
+pub(crate) static CONSTANTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Whether constant buffers that the host cannot bind where their copy in
+/// the card's memory has them (not on 256 bytes) are copied by the card,
+/// out of that copy, just before the list runs ([`HostList::card_fill`])
+/// instead of by the CPU into the list's upload memory at submission
+/// (`VICTORY_CONSTANTS_ON_CARD=1`, `alt`: in turn; off by default). Root
+/// views and descriptor tables both (for tables it is
+/// `VICTORY_TABLE_CBV_DIRECT`'s way).
+///
+/// Why: upload memory is the PC's. A root view there was a copy of up to
+/// 64 KiB a draw made by the CPU, and every shader that read its constants
+/// read them across the bus, which on a PCI Express 3.0 x8 card is what
+/// the card waits for most (it draws 37 of its 180 W while "busy"). From
+/// the card's copy they cross the bus once, as changed pages, in bulk.
+pub(crate) fn constants_on_card() -> bool {
+    static SWITCH: crate::turns::Switch = crate::turns::Switch::new(
+        "VICTORY_CONSTANTS_ON_CARD",
+        false,
+        "constant buffers off 256 bytes are copied by the card out of its copy",
+    );
+    SWITCH.on()
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -699,10 +728,22 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        CONSTANTS[0].fetch_add(u64::from(!srv), Ordering::Relaxed);
         return Some(gpu);
+    }
+    if !srv
+        && shadow.carded()
+        && constants_on_card()
+        && let Some(card) = list.card_fill(&shadow, address, len)
+    {
+        shadow.refresh(list, address, len);
+        CONSTANTS[5].fetch_add(1, Ordering::Relaxed);
+        return Some(card);
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
+    CONSTANTS[1].fetch_add(1, Ordering::Relaxed);
+    CONSTANTS[2].fetch_add(len, Ordering::Relaxed);
     Some(gpu)
 }
 
@@ -1088,6 +1129,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1217,6 +1263,9 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+        }
+        if p.stages.iter().any(|stage| stage.translated().stores) {
+            list.shaders_may_write();
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -2383,28 +2432,52 @@ impl State {
     /// ([`crate::ambient`]), if `p` is the program that resolves it and
     /// the stand-in is on. Whether anything was recorded.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         if crate::ambient::level().is_none() {
             return false;
         }
-        let (slot, offset) = crate::ambient::LIGHT;
-        let named = stage.translated().used.iter().any(|u| {
-            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-        });
-        let light = match self.roots_ref(true).get(usize::from(slot)) {
-            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
-                Some(View::Unordered(r, ..)) => r,
-                _ => 0,
-            },
+        // The view a table of the program names at (slot, offset), if the
+        // program uses one there.
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let named = stage.translated().used.iter().any(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            match self.roots_ref(true).get(usize::from(slot)) {
+                Some(Root::Table(table)) if named => crate::descriptor::view(table + u64::from(offset) * 4),
+                _ => None,
+            }
+        };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => {
+                    once!("reflections not held: the program that ends them has its tables otherwise");
+                    false
+                }
+            };
+        }
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
         if light == 0 {
             once!("no stand-in for indirect light: the resolve's tables are not as expected");
             return false;
         }
-        crate::ambient::replace(list, light as This)
+        // The scene's depth, for the shade in creases and under objects
+        // (`VICTORY_AMBIENT_SHADE`), if the resolve reads it where expected.
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2998,7 +3071,7 @@ impl State {
                         // constants sit beside what its dispatches write)
                         // the submission waited for them to land, about
                         // 190 ms a world frame, the submission lock held.
-                        if table_cbv_direct()
+                        if (table_cbv_direct() || constants_on_card())
                             && let Some(shadow) = crate::shadow::find(address, 1)
                             && shadow.left(address) >= u64::from(size)
                         {
@@ -3016,6 +3089,7 @@ impl State {
                             {
                                 shadow.refresh(list, address, u64::from(size));
                                 host.constant_at(index, gpu, size);
+                                CONSTANTS[6].fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
                         }
@@ -3024,6 +3098,8 @@ impl State {
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
+                        CONSTANTS[3].fetch_add(1, Ordering::Relaxed);
+                        CONSTANTS[4].fetch_add(u64::from(size), Ordering::Relaxed);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

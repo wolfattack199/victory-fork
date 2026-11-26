@@ -767,6 +767,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        // A wait for every shader write (the title's own, or ours for its
+        // buffers): what `crate::indirect`'s clamps need before them.
+        let waits_all = host.iter().any(|b| b.kind == 2 && b.first.is_null());
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -780,6 +783,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            if waits_all {
+                list.waited_for_writes();
+            }
         }
     }
     0
@@ -2011,6 +2017,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.waited_for_writes();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

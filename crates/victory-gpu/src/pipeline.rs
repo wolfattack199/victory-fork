@@ -65,6 +65,13 @@ pub(crate) struct Shader {
     /// ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -113,14 +120,29 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(windows)]
+            let ambient = crate::ambient::level().is_some();
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                // The programs the ambient light acts after, by name: looked
+                // for only while it is on (`VICTORY_AMBIENT`, read once), so
+                // that off it costs no walk of each new shader's container.
                 #[cfg(windows)]
-                resolves_light: crate::ambient::resolves(bytes),
+                resolves_light: ambient && crate::ambient::resolves(bytes),
+                #[cfg(windows)]
+                draws_sky: ambient
+                    && bytes
+                        .windows(crate::ambient::SKY.len())
+                        .any(|w| w == crate::ambient::SKY),
+                #[cfg(windows)]
+                ends_reflections: ambient
+                    && bytes
+                        .windows(crate::ambient::REFLECTED.len())
+                        .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]

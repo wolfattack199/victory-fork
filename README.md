@@ -19,50 +19,86 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | | State (2026-11-25) |
 |---|---|
 | Shader and pipeline caches | limited to 2 GB in total; they grew without a limit before. The entries not used for the longest go first. `victory cache` shows what they take, `victory cache --clear` empties them, `VICTORY_CACHE_MAX_MB` changes the limit |
-| Checks | 849 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others |
+| Checks | 852 tests pass, 1 fails, 15 are ignored. The one that fails (`same_target_conditional_branch_keeps_both_edge_blocks`) failed before this update too; two more fail in some runs and not in others |
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
-| Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
+| Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
 
 ### Working on right now
 
-- **Frame rate: 20 fps first, then 30.** A frame of 115 ms is, as far as it is
-  understood: the title records for about 58 ms (most of it in our code), our
-  submitting thread works about 95 ms, the card is busy about 80 ms, and these
-  run partly one after the other. 20 fps needs all of it under 50 ms.
-- **The card's share.** Of its 75 ms, about 20 are ours (sending changed bytes
-  up, hashing them). The title's own lists take 54 ms, more than expected of
-  this card; why is not known.
-- **The first 75 s after loading**, which still crawl.
+- **Frame rate: 20 fps first, then 30.** Our submitting thread works about
+  100 ms a frame: some 65 preparing (the descriptor tables the title wrote,
+  refreshing copies of its buffers) and 35 sending about 125 MB up to the card,
+  while the copy-back brings some 55 MB down. The card would allow about 18 fps
+  by itself. 20 fps needs all of it under 50 ms.
+- **Memory.** The game takes about 21 GB of the PC's commit, 10 GB of it the
+  card's memory (Windows charges that too), plus a 4 GB pool of the title's
+  pages. With other programs open the PC's limit came within 0.5 GB in every
+  run. 2.2 to 2.6 GB of the blocks textures are placed in stand empty, in
+  pieces, so no block can be given back.
+- **Flicker** (ground going black and back): textures the title fills after
+  writing their view are caught and uploaded again 1 to 7 frames late; whether
+  that is the cause is not known yet.
 
 ### Progress by area
 
 | Area | Done | Change | Based on |
 |---|---|---|---|
-| Frame rate towards 20 fps, first room, loaded | 42 % | 22 % before | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame) |
-| Frame rate towards 30 fps, the same | 28 % | 15 % before | the same run |
+| Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
+| Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
 | Frame rate in the opening cutscene | not measured again | 9 % before | 2.7 fps then |
-| Card time a frame, towards the 50 ms of 20 fps | 66 % | 55 % before | measured: 76 ms busy (54 the title's lists, 20 sending and hashing, 2 comparing); 90 in a run with every small copy in the PC's memory. It counts as done at 50 |
+| Card time a frame, towards the 50 ms of 20 fps | about 88 % | 66 % before, at more draws | measured: 54 to 60 ms busy in the last four runs (35 to 49 the title's lists, 9 to 19 sending and hashing, 2 comparing) at 2,900 to 3,900 draws a frame; it was 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
-| Picture looks right | about 75 % | 70 % before | estimate: the first room and its yard look right in most launches, see the table above; no ray traced shadows or reflections |
+| Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections |
+| Runs that finish | 4 of the last 6 | new row | measured: 6 minute runs m28, m31, m32, m33 ran to the end (m33 is this update as pushed: 8.72 fps, median 107 ms, 2,881 draws a frame). m29 and m30 froze (the title then ends itself after about 30 s) with a test switch on, `VICTORY_BACK_OWN_VIEW=alt`, which the launcher never sets |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
 | NVIDIA driver | 100 % | | the game draws through it |
 | DLSS | 0 % | | no code for it yet |
-| Ray tracing | 0 % | | off. A constant stands in for its indirect light (`VICTORY_AMBIENT`); that is not ray tracing |
+| Ray tracing | 0 % | | off. A stand-in for its indirect light (`VICTORY_AMBIENT`): a constant, less of it in creases and corners from the depth image. That is not ray tracing |
 
 The measured rows come from the first room on the PC below, with the Series S
 profile and the switches listed. The estimates are my own judgment, not
 measurements.
 
 ### New in this update
+
+No clear frame rate gain this time (see the table above); what changed:
+
+- **The stand-in for the ray traced light** (`crates/victory-gpu/src/ambient.rs`)
+  is KomanderDG88's newer one (their fork, after Belobug's): less light in
+  creases and corners, worked out from the depth image, and reflections held
+  to a part of the light around, so that glossy floors do not glow white. The
+  program it holds reflections after was not seen in these runs, so that part
+  has not acted here yet; the log says why when it does not. Read line by line
+  before merging; it reads and writes nothing outside the card.
+- **Indirect clamps wait less** (`VICTORY_CLAMP_LEAN`, now on; `=0` turns it
+  off): each of the ~1,900 indirect executions a frame waited for every shader
+  write before and after its clamp. After it the wait is never needed, before
+  it only if a draw that can store ran since the last such wait. 4.5 ms off the
+  usual frame, measured in turns in one run.
+- **Textures go into the fullest block first**, so that blocks empty as their
+  textures go. It helps while a scene loads (87 blocks against 89); in a running
+  scene 2.6 GB of them still stood empty in pieces.
+- **Keyboard and mouse take the play bindings by themselves** once the world
+  is shown: W A S D walk without F10 first (`VICTORY_KBM_AUTO_PLAY=0`: not;
+  F10 and Esc switch as before).
+- Measured in turns, no gain, off: only the bytes that differ sent up
+  (`VICTORY_COPY_CHANGED`: 13 % of what the title marks written differs, but
+  finding it costs as much as it saves, 154 against 151 ms); constants copied
+  on the card (`VICTORY_CONSTANTS_ON_CARD`, +3.5 ms); the copy-back through a
+  view of our own (`VICTORY_BACK_OWN_VIEW`: 178 against 153 ms now, and both
+  runs with it froze); windows of title memory cut at 1 MB (`VICTORY_WINDOW_KB=1024`:
+  0.7 GB less memory, 180 MB copied a frame against 121).
+
+### The update before (8.4 fps)
 
 Nearly all of the gain is in threads that no longer wait for one another. The
 same scene, the last minute of unattended runs (average fps / median ms):

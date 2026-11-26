@@ -38,7 +38,7 @@ struct Fence {
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
     /// For [`pace`]: when each wait above was asked for.
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     asked: Mutex<Vec<pace::Asked>>,
 }
 
@@ -60,7 +60,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         asked: Mutex::new(Vec::new()),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
@@ -97,11 +97,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         if !event.is_null() {
             set_event(event as usize);
         }
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         pace::ready();
         return S_OK;
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
         // With submissions sent to the card and not waited for
@@ -130,7 +130,7 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     pace::reached(this, &fence.asked, value);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
@@ -157,12 +157,12 @@ extern "system" fn gpu_address(this: This) -> u64 {
 }
 
 /// How the title paces itself on its fences, measured (diagnostics
-/// builds): which value it waits for, how long until our line gets the
+/// builds, or `VICTORY_PACE=1`): which value it waits for, how long until our line gets the
 /// fence there, and how many frames lie between the title's `Signal` on
 /// its queue and the fence being set. Run 233 put presents behind the
 /// line and the frame did not get shorter: the title waited somewhere
 /// else, and this says for what.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) mod pace {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -203,11 +203,24 @@ pub(crate) mod pace {
         unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
     }
 
+    /// Whether it is measured: always in diagnostics builds, else with
+    /// `VICTORY_PACE=1`.
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_PACE").is_some_and(|v| v == "1"))
+    }
+
     pub(super) fn ready() {
+        if !on() {
+            return;
+        }
         N[0].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn waits(fence: This, asked: &Mutex<Vec<Asked>>, value: u64, now: u64) {
+        if !on() {
+            return;
+        }
         let thread = thread();
         let render = thread == RENDER.load(Ordering::Relaxed);
         N[1].fetch_add(1, Ordering::Relaxed);
@@ -229,6 +242,9 @@ pub(crate) mod pace {
 
     /// The title called `Signal` for `fence` on a queue.
     pub(crate) fn signal_called(fence: usize, value: u64) {
+        if !on() {
+            return;
+        }
         let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
         if queued.len() < 4096 {
             queued.push((fence, value, Instant::now(), crate::queue::presented()));
@@ -236,6 +252,9 @@ pub(crate) mod pace {
     }
 
     pub(super) fn reached(fence: This, asked: &Mutex<Vec<Asked>>, value: u64) {
+        if !on() {
+            return;
+        }
         let frame = crate::queue::presented();
         let render = RENDER.load(Ordering::Relaxed);
         {
@@ -283,6 +302,9 @@ pub(crate) mod pace {
 
     /// Once a frame, on the thread that presents: a line every 256 frames.
     pub(crate) fn frame() {
+        if !on() {
+            return;
+        }
         RENDER.store(thread(), Ordering::Relaxed);
         let frame = crate::queue::presented();
         let last = LINE_AT.load(Ordering::Relaxed);
