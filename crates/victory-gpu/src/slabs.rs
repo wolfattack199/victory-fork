@@ -319,7 +319,7 @@ const PIECE_GRAIN: u64 = 4 << 10;
 ///
 /// A piece is given back when its staging buffer is dropped, which is after
 /// the last list that named it ran: the same moment a spare buffer was kept
-/// for the next texture before. Blocks wholly free for [`PIECES_IDLE`] go,
+/// for the next texture before. Blocks wholly free for [`pieces_idle`] go,
 /// but one: in run c13 (64 MB blocks, ten seconds) bursts of new textures
 /// left 28 to 35 blocks alive while 50 to 630 MB of them were in use.
 fn pieces_wanted() -> bool {
@@ -332,7 +332,13 @@ fn pieces_wanted() -> bool {
 }
 
 /// How long a block pieces are cut from is kept wholly free.
-const PIECES_IDLE: Duration = Duration::from_secs(2);
+/// (`VICTORY_UPLOAD_PIECES_IDLE_S`, seconds).
+fn pieces_idle() -> Duration {
+    static SECONDS: OnceLock<u64> = OnceLock::new();
+    Duration::from_secs(*SECONDS.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_PIECES_IDLE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2)
+    }))
+}
 
 /// The bytes all blocks pieces are cut from may hold
 /// (`VICTORY_UPLOAD_PIECES_MB`, 1536); past them a staging buffer is an
@@ -371,6 +377,10 @@ static PIECES: Mutex<Pieces> = Mutex::new(Pieces {
 /// For the log: blocks of upload memory alive, pieces cut from them since
 /// the start, and the bytes of those alive now.
 pub(crate) static CUT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For the log: blocks of upload memory made since the start, and the
+/// microseconds making and mapping them took.
+pub(crate) static BLOCKS_MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A mapped upload buffer for a staging buffer, from [`upload`].
 pub(crate) struct Upload {
@@ -425,7 +435,10 @@ fn piece(host: &Host, size: u64) -> Option<Upload> {
         return None;
     }
     // Made with no lock held: other threads go on cutting meanwhile.
+    let making = Instant::now();
     let (buffer, data) = host.upload_buffer(PIECE_BLOCK)?;
+    BLOCKS_MADE[0].fetch_add(1, Relaxed);
+    BLOCKS_MADE[1].fetch_add(making.elapsed().as_micros() as u64, Relaxed);
     crate::host::name(&buffer, || "a block of upload memory staging buffers are cut from".into());
     let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
     let block = match pieces.blocks.iter().position(Option::is_none) {
@@ -456,26 +469,53 @@ fn piece_done(block: u32, at: u64, bytes: u64) {
     }
 }
 
-/// Lets go of the blocks wholly free for `idle`, all but one.
+/// Lets go of the blocks wholly free for `idle`, all but [`pieces_kept`]
+/// (all but one of those wholly free for [`PIECES_KEPT_IDLE`]).
 fn let_go_idle_pieces(idle: Duration) {
     let mut gone = Vec::new();
     {
         let mut pieces = PIECES.lock().unwrap_or_else(|e| e.into_inner());
-        let empty: Vec<usize> = (0..pieces.empty_since.len())
-            .filter(|&b| pieces.empty_since[b].is_some_and(|since| since.elapsed() >= idle))
+        // Emptied longest ago first.
+        let mut empty: Vec<(usize, Duration)> = (0..pieces.empty_since.len())
+            .filter_map(|b| pieces.empty_since[b].map(|since| (b, since.elapsed())))
+            .filter(|&(_, empty)| empty >= idle)
             .collect();
-        let wholly = pieces.free.by_size.range((PIECE_BLOCK, 0, 0)..).count();
-        for &b in empty.iter().take(wholly.saturating_sub(1)) {
+        empty.sort_by_key(|&(_, empty)| std::cmp::Reverse(empty));
+        let mut wholly = pieces.free.by_size.range((PIECE_BLOCK, 0, 0)..).count();
+        for &(b, empty) in &empty {
+            // Some wholly free blocks stay for the next burst; all but one
+            // go once nothing took them for long.
+            let stay = if empty >= PIECES_KEPT_IDLE { 1 } else { pieces_kept().max(1) };
+            if wholly <= stay {
+                continue;
+            }
             if pieces.free.by_place.get(&(b as u32, 0)) == Some(&PIECE_BLOCK) {
                 pieces.free.remove(b as u32, 0);
                 pieces.empty_since[b] = None;
                 gone.extend(pieces.blocks[b].take());
                 CUT[0].fetch_sub(1, Relaxed);
+                wholly -= 1;
             }
         }
     }
     drop(gone);
 }
+
+/// How many wholly free blocks are kept for [`PIECES_KEPT_IDLE`] rather
+/// than [`pieces_idle`] (`VICTORY_UPLOAD_PIECES_KEEP`, 8: 256 MB; 1: one,
+/// as before). Making and mapping a block takes 26 ms (run c39: 188 blocks
+/// in 4.9 s); let go after two seconds empty, one was made again about
+/// every second through the opening cutscene, with 320 to 640 MB of blocks
+/// alive and 17 to 99 MB of them in use.
+fn pieces_kept() -> usize {
+    static KEPT: OnceLock<usize> = OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_PIECES_KEEP").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(8)
+    })
+}
+
+/// How long the blocks [`pieces_kept`] keeps may stay wholly free.
+const PIECES_KEPT_IDLE: Duration = Duration::from_secs(20);
 
 /// A mapped upload buffer of `size` bytes or more for a staging buffer.
 pub(crate) fn upload(host: &Host, size: u64) -> Option<Upload> {
@@ -531,7 +571,7 @@ pub(crate) fn upload_done(buffer: &ID3D12Resource, data: *mut u8, bytes: u64, pi
 }
 
 /// Lets go of the spare upload buffers nothing took in ten seconds, and of
-/// the blocks pieces are cut from wholly free for [`PIECES_IDLE`] (all but
+/// the blocks pieces are cut from wholly free for [`pieces_idle`] (all but
 /// one).
 pub(crate) fn let_go_idle() {
     const IDLE: Duration = Duration::from_secs(10);
@@ -548,7 +588,7 @@ pub(crate) fn let_go_idle() {
         spares.bytes -= bytes;
     }
     drop(gone);
-    let_go_idle_pieces(PIECES_IDLE);
+    let_go_idle_pieces(pieces_idle());
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ graphics on an NVIDIA RTX 5060 Ti (16 GB) first, speed after that.
 | In progress | about 150 fixes from VIctory and its open pull requests, mostly shader translation and graphics, on the `improvements` branch once every test passes |
 | Graphics in the game | **people, skin, clothes, streets, shops, cars and night lights draw** (since 2026-11-25). Right after a camera cut faces or skin can be black for a second, until their textures are there. From launch to launch a fence and wall photos, people in the distance and a neck come out right or wrong: not understood yet |
 | Frame rate in the world | **not playable: 8.4 fps average** (115 ms median) over a minute in the first room once it has loaded, 4.4 fps before. Runs since, played by hand: 5.8 to 9.2 fps in the last minute of each run, by where the player was; no clear change. While it loads, some 75 s, 0.4 to 4 fps. One scene on one PC; busier places are slower |
-| Frame rate in the opening cutscene | **about 4.7 fps** (2026-11-26, night: 4.87, 5.17, 5.48, 3.43, 4.10 and 5.25 in six runs of the same length; in the 3.43 a fault, now mended, turned the faster texture answer off a minute in), about 4.0 in the three clean runs before (3.41 to 4.63; the "about 4.2" said here before was two of them), about 3.5 before that, about 2.0 before that. Still far from 30 |
+| Frame rate in the opening cutscene | **about 4.8 fps** (2026-11-26, night: ten runs of the same length, 3.43 to 5.58, 4.81 on average; in the 3.43 a fault, now mended, turned the faster texture answer off a minute in), about 4.0 in the three clean runs before (3.41 to 4.63; the "about 4.2" said here before was two of them), about 3.5 before that, about 2.0 before that. Still far from 30 |
 
 The results in "Status of this fork" further down are fxceless's, measured on
 another PC.
@@ -63,14 +63,14 @@ another PC.
 | Frame rate towards 20 fps, first room, loaded | 42 % | no clear change | measured: 8.43 fps average over the last minute of a 4 minute run (511 frames, median 115 ms, 4,406 draws a frame). Runs since, played by hand: 5.8 to 9.2 fps (9.15 with 2,948 draws a frame) |
 | Frame rate towards 30 fps, the same | 28 % | no clear change | the same runs |
 | Frame rate while the room loads | about 5 % | no change | measured: 0.4 to 4 fps for about 75 s |
-| Frame rate in the opening cutscene, towards 20 fps | about 24 % | about 20 % before (21 % was said: two runs of three) | measured: 4.87, 5.17, 5.48, 3.43, 4.10 and 5.25 fps in six runs with textures' memory asked of the runtime (c32-c37), 4.72 on average (4.97 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
+| Frame rate in the opening cutscene, towards 20 fps | about 24 % | about 20 % before (21 % was said: two runs of three) | measured: 4.87, 5.17, 5.48, 3.43, 4.10, 5.25, 3.76, 5.22, 5.26 and 5.58 fps in ten runs with textures' memory asked of the runtime (c32-c41), 4.81 on average (4.96 without c35, where a fault since mended turned it off a minute in), at 2,015 to 3,343 draws a frame; 4.63, 3.85 and 3.41 in the three clean runs before it (c23, c24, c27), 3.96 on average; 2.86 to 3.97 in five runs before those (c13-c16, c19); about 2.0 before staging buffers were cut from blocks. Each run: the game started, the last 60 s of its first 75 s in the world measured. The scenes in that minute differ from run to run, so a few runs say the direction more surely than the size |
 | Frame rate in the opening cutscene, towards 30 fps | about 16 % | about 13 % before | the same runs |
 | Card time a frame, towards the 50 ms of 20 fps | about 97 % | 88 % before | measured: 44 to 53 ms busy in c32-c34, c36 and c37 (30 to 36 the title's lists, 13 to 17 sending and hashing, 1 to 1.5 comparing) at 2,700 to 3,300 draws a frame; 54 to 60 ms in the four runs before at 2,900 to 3,900 draws; 76 ms at 4,400. Fewer draws, not only a faster card. It counts as done at 50 |
 | Draws that reach the card | 94 % | 90 % before | measured: about 256 of 4,660 a frame are not run, 254 of them the ray tracing builder's programs, which are off on purpose |
 | Shaders that translate | 99 % | no change | measured earlier: 25,679 of 25,889 in the game's whole library |
 | Shaders the game asks for that fail | 4 left | no change | 3 refused by the driver, 1 not translated |
 | Picture looks right | about 75 % | no change | estimate: the first room and its yard look right in most launches; 20 of 20 frames of the last two clips lit and steady, without black or red faces; skin on arms looks grey; ground flicker reported; no ray traced shadows or reflections. In the opening cutscene (contact sheets of runs c16-c19): with this update faces were lit in the frames of c16 and c19; in c18, where it was switched on and off in turns, the two frames just after it came on had a black face and a head without its texture; with it turned off (c17) 4 of 9 frames had a black face or black arms. Green and yellow dots on one character's face in 3 frames of run c16, not seen in c17-c19: not understood yet |
-| Runs that finish | 30 of the last 30 short runs | 17 of 17 before | measured: the 75 s cutscene runs c8 to c37 ran to the end and closed cleanly. Longest frame 0.65 to 1.28 s in c32-c34 and c37, 2.1 and 2.2 s in c35 and c36; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
+| Runs that finish | 34 of the last 34 short runs | 17 of 17 before | measured: the 75 s cutscene runs c8 to c41 ran to the end and closed cleanly. Longest frame 0.65 to 1.28 s in c32-c34, c37 and c39-c41, 2.1 to 2.2 s in c35, c36 and c38; up to 2.3 s in the runs c26-c30, which were profiled or had switches on for measuring; 2.4 to 10.8 s in runs before c23 |
 | Textures and cars loading in time | about 55 % | no change | estimate |
 | Audio | about 88 % | 90 % before | measured: one gap of 0.54 s in a longer recording; the 88 s without a gap named here before were not the whole truth |
 | Keyboard and mouse | 100 % | | done |
@@ -127,6 +127,16 @@ are my own judgment, not measurements.
   Windows answer that once, and the placeholder is forgotten only at every
   fourth. c36 drew a busier scene (594 textures made a frame against about
   370 in c33, c34 and c37) and made 4.10 fps.
+- **Blocks of upload memory kept between bursts** (`crates/victory-gpu/src/slabs.rs`).
+  Making and mapping a block of 32 MB takes about 26 ms. Let go after two
+  seconds empty, blocks were made again about once a second through the
+  cutscene (run c39: 188 blocks in 4.9 s, and 638 upload buffers of their own
+  once the blocks had reached their limit). Now up to 8 wholly free blocks
+  (256 MB) stay for up to 20 s (`VICTORY_UPLOAD_PIECES_KEEP`, 1 as before).
+  c40 and c41: 95 and 101 blocks in 2.3 and 2.5 s, 33 and 42 upload buffers
+  of their own; 5.26 and 5.58 fps against 5.22 in c39, which is within what
+  runs differ by. The PC's commit came no nearer its limit than before (195
+  and 352 MB free at the closest; 146 to 498 MB in the 17 runs before).
 - **Tried, no gain.** Setting the title's fences as soon as its work is sent
   (`VICTORY_FENCE_EARLY=1`, for measuring only: frames can show before they are
   done): 3.46 fps (c30), so waiting for the card's fences is not what holds the
@@ -314,9 +324,9 @@ place) and because the card was full (`VICTORY_LEVELS_ON_DEMAND=1`).
 ### Corrections
 
 - **"About 5.2 fps" in the cutscene, said earlier the same night, was three
-  runs of six.** All six since textures' memory is asked of the runtime make
+  runs of six.** All six since textures' memory is asked of the runtime made
   4.72 on average, 4.97 without the run in which a fault (mended) turned it
-  off.
+  off; ten runs by now, 4.81.
 - **The cutscene's "about 4.2 fps" in the update before was two runs.** The
   third clean run after that change (c27) made 3.41 fps; the three together
   3.96.

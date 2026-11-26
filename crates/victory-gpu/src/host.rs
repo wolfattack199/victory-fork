@@ -9219,14 +9219,16 @@ impl Meter {
             let [made, again] = [0, 1].map(|i| crate::slabs::UPLOADS[i].load(Ordering::Relaxed));
             let (free, resting, whole) = crate::slabs::free_bytes();
             let [cut_blocks, cut, cut_bytes] = [0, 1, 2].map(|i| crate::slabs::CUT[i].load(Ordering::Relaxed));
+            let [blocks_made, making_us] = [0, 1].map(|i| crate::slabs::BLOCKS_MADE[i].load(Ordering::Relaxed));
             tracing::info!(
                 "textures placed in blocks of the card's memory: {placed} since the start, {blocks} blocks of 64 MB, of their \
                  bytes {} MB free ({whole} blocks wholly) and {} MB resting; upload buffers made {made}, used again {again}; \
                  staging buffers cut from blocks of upload memory (VICTORY_UPLOAD_PIECES) {cut} since the start, {cut_blocks} \
-                 blocks of 32 MB, {} MB of them in use",
+                 blocks of 32 MB, {} MB of them in use; blocks made since the start {blocks_made} in {} ms",
                 free >> 20,
                 resting >> 20,
-                cut_bytes >> 20
+                cut_bytes >> 20,
+                making_us / 1000
             );
             let guards: [f64; 10] =
                 std::array::from_fn(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
